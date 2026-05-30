@@ -1,22 +1,56 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type FormEvent,
+  type ChangeEvent,
+  type DragEvent,
+  type ReactNode,
+  type RefObject,
+} from "react";
 import axios from "axios";
 import {
+  AlertCircle,
   BarChart3,
   CheckCircle2,
-  AlertCircle,
   CalendarClock,
+  ChevronDown,
   Columns3,
   Database,
+  Download,
   FileSpreadsheet,
   Hash,
   Loader2,
-  TrendingDown,
-  TrendingUp,
+  MessageSquare,
+  Send,
+  Bot,
+  User,
+  PieChart as PieChartIcon,
   Sparkles,
   Table2,
+  TrendingDown,
+  TrendingUp,
   UploadCloud,
   X,
+  type LucideIcon,
 } from "lucide-react";
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  Legend,
+  Line,
+  LineChart,
+  Pie,
+  PieChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+  LabelList,
+} from "recharts";
 
 type RowValue = string | number | boolean | null;
 
@@ -53,6 +87,33 @@ type DatetimeColumnStat = {
 
 type ColumnStat = NumericColumnStat | TextColumnStat | DatetimeColumnStat;
 
+type NumericMetric = {
+  sum: number | null;
+  mean: number | null;
+};
+
+type AggregatedItem = {
+  label: string;
+  count: number;
+  numeric_metrics: Record<string, NumericMetric>;
+};
+
+type AggregatedSeries = {
+  column: string;
+  items: AggregatedItem[];
+};
+
+type ChartData = {
+  numeric_columns: string[];
+  categorical_columns: string[];
+  datetime_columns: string[];
+  primary_numeric_column: string | null;
+  primary_categorical_column: string | null;
+  primary_datetime_column: string | null;
+  categorical_distributions: Record<string, AggregatedSeries>;
+  date_trends: Record<string, AggregatedSeries>;
+};
+
 type UploadResponse = {
   filename: string;
   cleaned_data: Row[];
@@ -63,6 +124,7 @@ type UploadResponse = {
     categorical: string[];
     datetime: string[];
   };
+  chart_data: ChartData;
 };
 
 type ToastState = {
@@ -70,10 +132,23 @@ type ToastState = {
   message: string;
 };
 
+type ChatMessage = {
+  id: number;
+  role: "user" | "assistant" | "error";
+  content: string;
+};
+
+type ChatResponse = {
+  result: unknown;
+  code?: string;
+};
+
 const API_BASE_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8000";
 const numberFormatter = new Intl.NumberFormat("en-US", {
   maximumFractionDigits: 2,
 });
+
+const CHART_COLORS = ["#4f46e5", "#6366f1", "#8b5cf6", "#0f766e", "#14b8a6", "#1d4ed8", "#a855f7"];
 
 function formatCellValue(value: RowValue): string {
   if (value === null || value === undefined || value === "") {
@@ -114,6 +189,35 @@ function formatDateValue(value: string | null | undefined): string {
   });
 }
 
+function resolveNumericMetric(item: AggregatedItem, selectedNumeric: string): number {
+  if (selectedNumeric) {
+    const metric = item.numeric_metrics[selectedNumeric];
+    if (metric?.sum !== null && metric?.sum !== undefined) {
+      return metric.sum;
+    }
+  }
+
+  return item.count;
+}
+
+function downloadSvgChart(containerRef: RefObject<HTMLDivElement>, filename: string) {
+  const svgElement = containerRef.current?.querySelector("svg");
+  if (!svgElement) {
+    return;
+  }
+
+  const serializer = new XMLSerializer();
+  const svgSource = serializer.serializeToString(svgElement);
+  const svgBlob = new Blob([svgSource], { type: "image/svg+xml;charset=utf-8" });
+  const svgUrl = URL.createObjectURL(svgBlob);
+  const downloadLink = document.createElement("a");
+
+  downloadLink.href = svgUrl;
+  downloadLink.download = filename;
+  downloadLink.click();
+  URL.revokeObjectURL(svgUrl);
+}
+
 export default function App() {
   const [file, setFile] = useState<File | null>(null);
   const [rows, setRows] = useState<Row[]>([]);
@@ -122,8 +226,25 @@ export default function App() {
   const [error, setError] = useState("");
   const [metadata, setMetadata] = useState<SummaryMetric | null>(null);
   const [statistics, setStatistics] = useState<Record<string, ColumnStat>>({});
+  const [chartData, setChartData] = useState<ChartData | null>(null);
   const [toast, setToast] = useState<ToastState | null>(null);
+  const [selectedCategorical, setSelectedCategorical] = useState("");
+  const [selectedNumeric, setSelectedNumeric] = useState("");
+  const [selectedDatetime, setSelectedDatetime] = useState("");
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
+    {
+      id: 1,
+      role: "assistant",
+      content: "Upload a dataset and ask me about it. I can summarize rows, filter records, and explain patterns.",
+    },
+  ]);
+  const [chatInput, setChatInput] = useState("");
+  const [isChatting, setIsChatting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const barChartRef = useRef<HTMLDivElement | null>(null);
+  const pieChartRef = useRef<HTMLDivElement | null>(null);
+  const lineChartRef = useRef<HTMLDivElement | null>(null);
+  const chatListRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (!toast) {
@@ -136,6 +257,34 @@ export default function App() {
 
     return () => window.clearTimeout(timer);
   }, [toast]);
+
+  useEffect(() => {
+    if (!chartData) {
+      return;
+    }
+
+    setSelectedCategorical((current) =>
+      chartData.categorical_columns.includes(current)
+        ? current
+        : chartData.primary_categorical_column ?? chartData.categorical_columns[0] ?? "",
+    );
+    setSelectedNumeric((current) =>
+      chartData.numeric_columns.includes(current)
+        ? current
+        : chartData.primary_numeric_column ?? chartData.numeric_columns[0] ?? "",
+    );
+    setSelectedDatetime((current) =>
+      chartData.datetime_columns.includes(current)
+        ? current
+        : chartData.primary_datetime_column ?? chartData.datetime_columns[0] ?? "",
+    );
+  }, [chartData]);
+
+  useEffect(() => {
+    if (chatListRef.current) {
+      chatListRef.current.scrollTop = chatListRef.current.scrollHeight;
+    }
+  }, [chatMessages, isChatting]);
 
   const columns = useMemo(() => {
     if (rows.length === 0) {
@@ -172,12 +321,63 @@ export default function App() {
     ];
   }, [metadata]);
 
-  const columnEntries = useMemo(
-    () => Object.entries(statistics),
-    [statistics],
-  );
+  const columnEntries = useMemo(() => Object.entries(statistics), [statistics]);
 
-  const uploadFile = async (selectedFile: File) => {
+  const activeCategoricalSeries = useMemo(() => {
+    if (!chartData || !selectedCategorical) {
+      return null;
+    }
+
+    return chartData.categorical_distributions[selectedCategorical] ?? null;
+  }, [chartData, selectedCategorical]);
+
+  const activeDateSeries = useMemo(() => {
+    if (!chartData || !selectedDatetime) {
+      return null;
+    }
+
+    return chartData.date_trends[selectedDatetime] ?? null;
+  }, [chartData, selectedDatetime]);
+
+  const barChartRows = useMemo(() => {
+    if (!activeCategoricalSeries) {
+      return [];
+    }
+
+    return activeCategoricalSeries.items.map((item) => ({
+      label: item.label,
+      value: resolveNumericMetric(item, selectedNumeric),
+      count: item.count,
+    }));
+  }, [activeCategoricalSeries, selectedNumeric]);
+
+  const pieChartRows = useMemo(() => {
+    if (!activeCategoricalSeries) {
+      return [];
+    }
+
+    const totalCount = activeCategoricalSeries.items.reduce((sum, item) => sum + item.count, 0) || 1;
+
+    return activeCategoricalSeries.items.map((item) => ({
+      label: item.label,
+      value: item.count,
+      percentage: (item.count / totalCount) * 100,
+    }));
+  }, [activeCategoricalSeries]);
+
+  const lineChartRows = useMemo(() => {
+    if (!activeDateSeries) {
+      return [];
+    }
+
+    return activeDateSeries.items.map((item) => ({
+      label: item.label,
+      value: resolveNumericMetric(item, selectedNumeric),
+      count: item.count,
+    }));
+  }, [activeDateSeries, selectedNumeric]);
+
+  const handleUpload = async (selectedFile: File) => {
     setError("");
     setIsUploading(true);
     setFile(selectedFile);
@@ -187,22 +387,19 @@ export default function App() {
       const formData = new FormData();
       formData.append("file", selectedFile);
 
-      const response = await axios.post<UploadResponse>(
-        `${API_BASE_URL}/upload`,
-        formData,
-        {
-          headers: {
-            "Content-Type": "multipart/form-data",
-          },
+      const response = await axios.post<UploadResponse>(`${API_BASE_URL}/upload`, formData, {
+        headers: {
+          "Content-Type": "multipart/form-data",
         },
-      );
+      });
 
       setRows(response.data.cleaned_data ?? []);
       setMetadata(response.data.metadata ?? null);
       setStatistics(response.data.statistics ?? {});
+      setChartData(response.data.chart_data ?? null);
       setToast({
         title: "Success",
-        message: "Data cleaned and analyzed successfully.",
+        message: "Data cleaned, analyzed, and visualized successfully.",
       });
     } catch (requestError) {
       const message =
@@ -213,26 +410,27 @@ export default function App() {
       setRows([]);
       setMetadata(null);
       setStatistics({});
+      setChartData(null);
       setToast(null);
     } finally {
       setIsUploading(false);
     }
   };
 
-  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileChange = (event: ChangeEvent<HTMLInputElement>) => {
     const selectedFile = event.target.files?.[0];
     if (selectedFile) {
-      void uploadFile(selectedFile);
+      void handleUpload(selectedFile);
     }
 
     event.target.value = "";
   };
 
-  const handleDrop = (event: React.DragEvent<HTMLLabelElement>) => {
+  const handleDrop = (event: DragEvent<HTMLLabelElement>) => {
     event.preventDefault();
     const droppedFile = event.dataTransfer.files?.[0];
     if (droppedFile) {
-      void uploadFile(droppedFile);
+      void handleUpload(droppedFile);
     }
   };
 
@@ -243,10 +441,69 @@ export default function App() {
     setError("");
     setMetadata(null);
     setStatistics({});
+    setChartData(null);
+    setSelectedCategorical("");
+    setSelectedNumeric("");
+    setSelectedDatetime("");
     setToast(null);
+
     if (fileInputRef.current) {
       fileInputRef.current.value = "";
     }
+  };
+
+  const sendChatMessage = async () => {
+    const trimmedQuery = chatInput.trim();
+    if (!trimmedQuery || isChatting) {
+      return;
+    }
+
+    const userMessage: ChatMessage = {
+      id: Date.now(),
+      role: "user",
+      content: trimmedQuery,
+    };
+
+    setChatMessages((currentMessages) => [...currentMessages, userMessage]);
+    setChatInput("");
+    setIsChatting(true);
+
+    try {
+      const response = await axios.post<ChatResponse>(`${API_BASE_URL}/chat`, {
+        user_query: trimmedQuery,
+      });
+
+      const answer = renderChatResult(response.data.result);
+      setChatMessages((currentMessages) => [
+        ...currentMessages,
+        {
+          id: Date.now() + 1,
+          role: "assistant",
+          content: answer,
+        },
+      ]);
+    } catch (requestError) {
+      const message =
+        axios.isAxiosError(requestError) && requestError.response?.data?.detail
+          ? requestError.response.data.detail
+          : "I could not answer that right now. Please try again.";
+
+      setChatMessages((currentMessages) => [
+        ...currentMessages,
+        {
+          id: Date.now() + 1,
+          role: "error",
+          content: message,
+        },
+      ]);
+    } finally {
+      setIsChatting(false);
+    }
+  };
+
+  const handleChatSubmit = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    await sendChatMessage();
   };
 
   return (
@@ -279,14 +536,14 @@ export default function App() {
             <div className="max-w-2xl">
               <p className="mb-3 inline-flex items-center gap-2 rounded-full bg-emerald-100 px-4 py-2 text-sm font-semibold text-emerald-800">
                 <Sparkline />
-                Phase 2 Data Intelligence Workspace
+                Phase 3 Automated Visualizations
               </p>
               <h1 className="text-4xl font-semibold tracking-tight text-slate-950 md:text-5xl">
                 AI Data Analyst Platform
               </h1>
               <p className="mt-4 text-base leading-7 text-slate-600 md:text-lg">
-                Upload a CSV or Excel file, let the backend clean and analyze it,
-                then review the insights, statistics, and preview table in one place.
+                Upload a dataset, let the backend clean and aggregate it, then explore
+                modern charted insights with a professional dashboard layout.
               </p>
             </div>
 
@@ -316,8 +573,8 @@ export default function App() {
             </div>
             <h2 className="text-2xl font-semibold text-slate-900">Upload your file</h2>
             <p className="mt-3 max-w-xl text-sm leading-6 text-slate-600 md:text-base">
-              Drag and drop a spreadsheet here or click to browse. The backend
-              will parse the file and return a preview table.
+              Drag and drop a spreadsheet here or click to browse. The backend will
+              clean, analyze, and aggregate the file for chart rendering.
             </p>
             <div className="mt-6 flex flex-wrap items-center justify-center gap-3 text-sm text-slate-500">
               {fileName ? (
@@ -384,7 +641,7 @@ export default function App() {
             <>
               <div className="grid gap-4 md:grid-cols-3">
                 {summaryCards.map((card) => {
-                  const Icon = card.icon;
+                  const Icon = card.icon as LucideIcon;
 
                   return (
                     <article
@@ -406,6 +663,182 @@ export default function App() {
                     </article>
                   );
                 })}
+              </div>
+
+              <div className="mt-6 rounded-[1.75rem] border border-slate-200 bg-slate-50/70 p-5 shadow-sm">
+                <div className="flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
+                  <div>
+                    <h4 className="flex items-center gap-2 text-xl font-semibold tracking-tight text-slate-950">
+                      <PieChartIcon className="h-5 w-5 text-indigo-600" />
+                      Visual Dashboard
+                    </h4>
+                    <p className="mt-2 text-sm text-slate-500">
+                      Auto-selected charts with manual axis controls for category, metric, and date.
+                    </p>
+                  </div>
+                  <div className="rounded-full bg-white px-4 py-2 text-xs font-semibold uppercase tracking-[0.16em] text-slate-500 ring-1 ring-slate-200">
+                    Bento Grid Charts
+                  </div>
+                </div>
+
+                <div className="mt-5 grid gap-4 md:grid-cols-3">
+                  <ChartSelect
+                    label="Category axis"
+                    value={selectedCategorical}
+                    onChange={setSelectedCategorical}
+                    options={chartData?.categorical_columns ?? []}
+                    placeholder="Select categorical"
+                  />
+                  <ChartSelect
+                    label="Metric axis"
+                    value={selectedNumeric}
+                    onChange={setSelectedNumeric}
+                    options={chartData?.numeric_columns ?? []}
+                    placeholder="Count"
+                    allowCountFallback
+                  />
+                  <ChartSelect
+                    label="Date axis"
+                    value={selectedDatetime}
+                    onChange={setSelectedDatetime}
+                    options={chartData?.datetime_columns ?? []}
+                    placeholder="Select date"
+                  />
+                </div>
+
+                <div className="mt-6 grid gap-4 xl:grid-cols-12">
+                  <ChartCard
+                    title="Bar Chart"
+                    description={`Distribution of ${selectedCategorical || "a categorical column"}`}
+                    badge={selectedCategorical ? `${selectedCategorical}` : "No category selected"}
+                    containerRef={barChartRef}
+                    onDownload={() => downloadSvgChart(barChartRef, `bar-chart-${selectedCategorical || "chart"}.svg`)}
+                    className="xl:col-span-7"
+                  >
+                    {activeCategoricalSeries && barChartRows.length > 0 ? (
+                      <ResponsiveContainer width="100%" height={340}>
+                        <BarChart data={barChartRows} margin={{ top: 10, right: 16, left: 4, bottom: 8 }}>
+                          <defs>
+                            <linearGradient id="barGradient" x1="0" y1="0" x2="0" y2="1">
+                              <stop offset="5%" stopColor="#6366f1" stopOpacity={0.95} />
+                              <stop offset="95%" stopColor="#8b5cf6" stopOpacity={0.85} />
+                            </linearGradient>
+                          </defs>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                          <XAxis dataKey="label" tick={{ fill: "#475569", fontSize: 12 }} interval={0} angle={-20} dy={10} />
+                          <YAxis tick={{ fill: "#475569", fontSize: 12 }} />
+                          <Tooltip
+                            contentStyle={{
+                              borderRadius: "16px",
+                              border: "1px solid #e2e8f0",
+                              backgroundColor: "rgba(255,255,255,0.98)",
+                              boxShadow: "0 16px 40px -24px rgba(15,23,42,0.55)",
+                            }}
+                            formatter={(value) => [formatNumber(Number(value)), selectedNumeric || "Count"]}
+                          />
+                          <Legend />
+                          <Bar dataKey="value" name={selectedNumeric || "Count"} fill="url(#barGradient)" radius={[10, 10, 0, 0]}>
+                            <LabelList dataKey="value" position="top" formatter={(value) => formatNumber(Number(value))} />
+                          </Bar>
+                        </BarChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <EmptyChartState message="Upload data to generate the categorical distribution chart." />
+                    )}
+                  </ChartCard>
+
+                  <ChartCard
+                    title="Pie Chart"
+                    description={`Percentage breakdown of ${selectedCategorical || "a category"}`}
+                    badge={selectedCategorical ? `${selectedCategorical}` : "No category selected"}
+                    containerRef={pieChartRef}
+                    onDownload={() => downloadSvgChart(pieChartRef, `pie-chart-${selectedCategorical || "chart"}.svg`)}
+                    className="xl:col-span-5"
+                  >
+                    {activeCategoricalSeries && pieChartRows.length > 0 ? (
+                      <ResponsiveContainer width="100%" height={340}>
+                        <PieChart>
+                          <Tooltip
+                            contentStyle={{
+                              borderRadius: "16px",
+                              border: "1px solid #e2e8f0",
+                              backgroundColor: "rgba(255,255,255,0.98)",
+                              boxShadow: "0 16px 40px -24px rgba(15,23,42,0.55)",
+                            }}
+                            formatter={(value, _name, payload) => {
+                              const row = payload?.payload as { percentage?: number } | undefined;
+                              return [`${formatNumber(Number(value))} (${formatNumber(row?.percentage ?? 0)}%)`, "Count"];
+                            }}
+                          />
+                          <Pie
+                            data={pieChartRows}
+                            dataKey="value"
+                            nameKey="label"
+                            cx="50%"
+                            cy="50%"
+                            innerRadius={72}
+                            outerRadius={120}
+                            paddingAngle={3}
+                            label={({ percent }) => `${Math.round((percent ?? 0) * 100)}%`}
+                          >
+                            {pieChartRows.map((entry, index) => (
+                              <Cell key={`${entry.label}-${index}`} fill={CHART_COLORS[index % CHART_COLORS.length]} />
+                            ))}
+                          </Pie>
+                          <Legend />
+                        </PieChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <EmptyChartState message="Upload data to generate the category percentage breakdown." />
+                    )}
+                  </ChartCard>
+
+                  <ChartCard
+                    title="Line Chart"
+                    description={`Trend of ${selectedNumeric || "record count"} over ${selectedDatetime || "time"}`}
+                    badge={selectedDatetime ? `${selectedDatetime}` : "No date selected"}
+                    containerRef={lineChartRef}
+                    onDownload={() => downloadSvgChart(lineChartRef, `line-chart-${selectedDatetime || "chart"}.svg`)}
+                    className="xl:col-span-12"
+                  >
+                    {activeDateSeries && lineChartRows.length > 0 ? (
+                      <ResponsiveContainer width="100%" height={340}>
+                        <LineChart data={lineChartRows} margin={{ top: 10, right: 16, left: 4, bottom: 8 }}>
+                          <defs>
+                            <linearGradient id="lineGradient" x1="0" y1="0" x2="1" y2="0">
+                              <stop offset="0%" stopColor="#4f46e5" stopOpacity={0.95} />
+                              <stop offset="100%" stopColor="#a855f7" stopOpacity={0.95} />
+                            </linearGradient>
+                          </defs>
+                          <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                          <XAxis dataKey="label" tick={{ fill: "#475569", fontSize: 12 }} minTickGap={24} />
+                          <YAxis tick={{ fill: "#475569", fontSize: 12 }} />
+                          <Tooltip
+                            contentStyle={{
+                              borderRadius: "16px",
+                              border: "1px solid #e2e8f0",
+                              backgroundColor: "rgba(255,255,255,0.98)",
+                              boxShadow: "0 16px 40px -24px rgba(15,23,42,0.55)",
+                            }}
+                            formatter={(value) => [formatNumber(Number(value)), selectedNumeric || "Count"]}
+                          />
+                          <Legend />
+                          <Line
+                            type="monotone"
+                            dataKey="value"
+                            name={selectedNumeric || "Count"}
+                            stroke="url(#lineGradient)"
+                            strokeWidth={3}
+                            dot={{ r: 4, strokeWidth: 2, fill: "#ffffff" }}
+                            activeDot={{ r: 7 }}
+                          />
+                        </LineChart>
+                      </ResponsiveContainer>
+                    ) : (
+                      <EmptyChartState message="Upload data with a date column to reveal the timeline trend." />
+                    )}
+                  </ChartCard>
+                </div>
               </div>
 
               <div className="mt-6 grid gap-4 lg:grid-cols-2">
@@ -480,7 +913,7 @@ export default function App() {
             </>
           ) : (
             <div className="rounded-[1.5rem] border border-dashed border-slate-300 bg-slate-50 p-6 text-slate-500">
-              No analysis yet. Upload a file to generate cleaned data, metadata, and statistics.
+              No analysis yet. Upload a file to generate cleaned data, metadata, and visualizations.
             </div>
           )}
         </section>
@@ -493,7 +926,7 @@ export default function App() {
                 Data Preview
               </h3>
               <p className="mt-2 text-sm text-slate-500">
-                Showing the first 10 rows returned by the backend.
+                Showing the first 15 cleaned rows returned by the backend.
               </p>
             </div>
             {rows.length > 0 ? (
@@ -510,8 +943,7 @@ export default function App() {
               </div>
               <h4 className="mt-5 text-xl font-semibold text-slate-900">No data available</h4>
               <p className="mt-2 max-w-md text-sm leading-6 text-slate-500">
-                Upload a file to populate this preview table. The table will update
-                automatically once the backend responds.
+                Upload a file to populate this preview table. The table will update automatically once the backend responds.
               </p>
             </div>
           ) : (
@@ -548,7 +980,218 @@ export default function App() {
           )}
         </section>
       </div>
+
+      <aside className="fixed bottom-4 right-4 z-40 w-[min(92vw,380px)] rounded-[1.75rem] border border-slate-200 bg-white/95 shadow-2xl backdrop-blur-xl">
+        <div className="flex items-center justify-between border-b border-slate-200 px-4 py-4">
+          <div className="flex items-center gap-3">
+            <div className="rounded-2xl bg-indigo-600 p-2 text-white shadow-sm">
+              <MessageSquare className="h-5 w-5" />
+            </div>
+            <div>
+              <p className="text-sm font-semibold text-slate-950">Chat with your Data</p>
+              <p className="text-xs text-slate-500">Gemini-powered analysis assistant</p>
+            </div>
+          </div>
+          <span className="rounded-full bg-indigo-50 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-indigo-700">
+            AI Chat
+          </span>
+        </div>
+
+        <div ref={chatListRef} className="max-h-[360px] space-y-3 overflow-y-auto px-4 py-4">
+          {chatMessages.map((message) => (
+            <ChatBubble key={message.id} message={message} />
+          ))}
+          {isChatting ? (
+            <div className="flex items-start gap-3">
+              <div className="rounded-2xl bg-indigo-100 p-2 text-indigo-700">
+                <Bot className="h-4 w-4" />
+              </div>
+              <div className="rounded-3xl rounded-tl-sm bg-slate-100 px-4 py-3 text-sm text-slate-600 shadow-sm">
+                Typing...
+              </div>
+            </div>
+          ) : null}
+        </div>
+
+        <form onSubmit={handleChatSubmit} className="border-t border-slate-200 p-4">
+          <div className="flex items-end gap-2 rounded-[1.25rem] border border-slate-200 bg-slate-50 px-3 py-3 shadow-sm focus-within:border-indigo-400 focus-within:bg-white">
+            <textarea
+              value={chatInput}
+              onChange={(event) => setChatInput(event.target.value)}
+              placeholder={rows.length > 0 ? "Ask about your data..." : "Upload a file first to start chatting..."}
+              rows={2}
+              disabled={rows.length === 0 || isUploading}
+              className="min-h-[48px] flex-1 resize-none bg-transparent text-sm text-slate-800 outline-none placeholder:text-slate-400 disabled:cursor-not-allowed"
+            />
+            <button
+              type="submit"
+              disabled={!chatInput.trim() || rows.length === 0 || isChatting || isUploading}
+              className="inline-flex h-11 w-11 items-center justify-center rounded-2xl bg-indigo-600 text-white transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-300"
+            >
+              <Send className="h-4 w-4" />
+            </button>
+          </div>
+          <p className="mt-2 text-[11px] leading-5 text-slate-500">
+            Ask natural language questions like “What are the top categories?” or “Show the average sales by day.”
+          </p>
+        </form>
+      </aside>
     </main>
+  );
+}
+
+function ChartCard({
+  title,
+  description,
+  badge,
+  containerRef,
+  onDownload,
+  className,
+  children,
+}: {
+  title: string;
+  description: string;
+  badge: string;
+  containerRef: RefObject<HTMLDivElement>;
+  onDownload: () => void;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <article className={`rounded-[1.5rem] border border-slate-200 bg-white p-5 shadow-sm ${className ?? ""}`}>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Chart</p>
+          <h5 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">{title}</h5>
+          <p className="mt-2 text-sm leading-6 text-slate-500">{description}</p>
+        </div>
+        <div className="flex flex-col items-end gap-2">
+          <span className="inline-flex items-center rounded-full bg-slate-50 px-3 py-1 text-xs font-semibold text-slate-600 ring-1 ring-slate-200">
+            {badge}
+          </span>
+          <button
+            type="button"
+            onClick={onDownload}
+            className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-700 transition hover:border-slate-300 hover:bg-slate-50"
+          >
+            <Download className="h-3.5 w-3.5" />
+            Download Chart as Image
+          </button>
+        </div>
+      </div>
+
+      <div ref={containerRef} className="mt-5 h-[340px] w-full">
+        {children}
+      </div>
+    </article>
+  );
+}
+
+function ChartSelect({
+  label,
+  value,
+  onChange,
+  options,
+  placeholder,
+  allowCountFallback = false,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  options: string[];
+  placeholder: string;
+  allowCountFallback?: boolean;
+}) {
+  return (
+    <label className="block rounded-[1.25rem] border border-slate-200 bg-white p-4 shadow-sm">
+      <span className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-400">{label}</span>
+      <div className="relative mt-3">
+        <select
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          className="w-full appearance-none rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 pr-10 text-sm font-medium text-slate-800 outline-none transition focus:border-indigo-400 focus:bg-white"
+        >
+          {allowCountFallback ? <option value="">Count</option> : <option value="">{placeholder}</option>}
+          {options.map((option) => (
+            <option key={option} value={option}>
+              {option}
+            </option>
+          ))}
+        </select>
+        <ChevronDown className="pointer-events-none absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-500" />
+      </div>
+    </label>
+  );
+}
+
+function ChatBubble({ message }: { message: ChatMessage }) {
+  const isUser = message.role === "user";
+  const isError = message.role === "error";
+
+  return (
+    <div className={`flex items-start gap-3 ${isUser ? "justify-end" : ""}`}>
+      {!isUser ? (
+        <div className={`rounded-2xl p-2 ${isError ? "bg-red-100 text-red-700" : "bg-indigo-100 text-indigo-700"}`}>
+          {isError ? <AlertCircle className="h-4 w-4" /> : <Bot className="h-4 w-4" />}
+        </div>
+      ) : null}
+      <div
+        className={`max-w-[80%] rounded-3xl px-4 py-3 text-sm leading-6 shadow-sm ${
+          isUser
+            ? "rounded-tr-sm bg-indigo-600 text-white"
+            : isError
+              ? "rounded-tl-sm bg-red-50 text-red-700 ring-1 ring-red-200"
+              : "rounded-tl-sm bg-slate-100 text-slate-700"
+        }`}
+      >
+        <div className="mb-1 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.16em] opacity-70">
+          {isUser ? (
+            <>
+              <User className="h-3 w-3" /> You
+            </>
+          ) : isError ? (
+            <>
+              <AlertCircle className="h-3 w-3" /> Error
+            </>
+          ) : (
+            <>
+              <Bot className="h-3 w-3" /> Gemini
+            </>
+          )}
+        </div>
+        <p className="whitespace-pre-wrap">{message.content}</p>
+      </div>
+      {isUser ? (
+        <div className="rounded-2xl bg-indigo-100 p-2 text-indigo-700">
+          <User className="h-4 w-4" />
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function renderChatResult(result: unknown): string {
+  if (result === null || result === undefined) {
+    return "No result returned.";
+  }
+
+  if (typeof result === "string") {
+    return result;
+  }
+
+  return JSON.stringify(result, null, 2);
+}
+
+function EmptyChartState({ message }: { message: string }) {
+  return (
+    <div className="flex h-full min-h-[250px] items-center justify-center rounded-[1.25rem] border border-dashed border-slate-200 bg-slate-50 px-6 text-center text-sm leading-6 text-slate-500">
+      <div className="max-w-sm">
+        <div className="mx-auto mb-4 rounded-full bg-white p-3 shadow-sm ring-1 ring-slate-200">
+          <Sparkles className="h-6 w-6 text-slate-400" />
+        </div>
+        {message}
+      </div>
+    </div>
   );
 }
 
@@ -560,7 +1203,7 @@ function MetricPill({
 }: {
   label: string;
   value: string;
-  icon: typeof Hash;
+  icon: LucideIcon;
   fullWidth?: boolean;
 }) {
   return (
@@ -587,4 +1230,3 @@ function Sparkline() {
     </svg>
   );
 }
-
