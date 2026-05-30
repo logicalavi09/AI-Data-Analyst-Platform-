@@ -2,16 +2,20 @@ import os
 import warnings
 import logging
 import traceback
+import numbers
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
+import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from sklearn.ensemble import IsolationForest
+from sklearn.linear_model import LinearRegression
 
 load_dotenv()
 
@@ -99,12 +103,12 @@ async def chat_with_data(payload: ChatRequest) -> dict[str, object]:
         dataframe = CURRENT_DATAFRAME
         column_names = list(dataframe.columns)
         system_prompt = (
-            "You are a Python Data Analyst. I have a pandas DataFrame named 'df'. "
-            f"The columns are: {column_names}. "
-            f"Write Python code that answers this question: '{payload.user_query}'. "
-            "Return ONLY raw python code. No markdown, no backticks, no comments. "
-            "Use 'result' variable to store the final answer. "
-            "If the answer is a value, result = value. If it's a table, result = df_subset.to_dict()."
+            "You are a data analyst. Use ONLY the provided 'df'. "
+            "Do not try to import multiprocessing, os, or sys. Write simple pandas code. "
+            "The answer must be stored in a variable named 'result'. "
+            f"Columns: {column_names}. "
+            f"Question: {payload.user_query}. "
+            "Return ONLY raw python code. No markdown, no backticks, no comments."
         )
 
         model = genai.GenerativeModel(model_name)
@@ -113,9 +117,9 @@ async def chat_with_data(payload: ChatRequest) -> dict[str, object]:
         raw_ai_code = response.text or ""
         print(f"Raw AI Code: {raw_ai_code}", flush=True)
         clean_code = raw_ai_code.replace("```python", "").replace("```", "").strip()
-        generated_code = sanitize_gemini_code(clean_code)
+        clean_code = sanitize_gemini_code(clean_code)
 
-        if not generated_code:
+        if not clean_code:
             return JSONResponse(status_code=500, content={"error": "Gemini returned empty code."})
 
         safe_builtins = {
@@ -138,11 +142,11 @@ async def chat_with_data(payload: ChatRequest) -> dict[str, object]:
             "sum": sum,
             "tuple": tuple,
         }
-        execution_globals = {"df": dataframe.copy(), "pd": pd, "__builtins__": safe_builtins}
+        execution_globals = {"df": dataframe.copy(), "pd": pd, "np": np, "__builtins__": __builtins__}
         execution_locals: dict[str, Any] = {}
 
         try:
-            exec(generated_code, execution_globals, execution_locals)
+            exec(clean_code, execution_globals, execution_locals)
         except Exception as exec_exc:
             logger.exception("Error executing Gemini-generated code: %s", exec_exc)
             print(f"DEBUG: {str(exec_exc)}", flush=True)
@@ -153,17 +157,48 @@ async def chat_with_data(payload: ChatRequest) -> dict[str, object]:
             )
 
         result = execution_locals.get("result", execution_globals.get("result"))
+        result = normalize_chat_result(result)
         if result is None:
             return JSONResponse(status_code=500, content={"error": "Gemini code did not produce a result variable."})
 
         return {
             "result": serialize_chat_result(result),
-            "code": generated_code,
+            "code": clean_code,
         }
     except Exception as exc:
         print(f"DEBUG: {str(exc)}", flush=True)
         print(traceback.format_exc(), flush=True)
         logger.exception("Unhandled error in /chat: %s", exc)
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+@app.get("/anomalies")
+async def get_anomalies() -> dict[str, object]:
+    if CURRENT_DATAFRAME is None:
+        return JSONResponse(status_code=400, content={"error": "Data not found. Please re-upload your file."})
+
+    try:
+        report = generate_anomaly_report(CURRENT_DATAFRAME)
+        return report
+    except Exception as exc:
+        print(f"DEBUG: {str(exc)}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        logger.exception("Unhandled error in /anomalies: %s", exc)
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+@app.get("/forecast")
+async def get_forecast() -> dict[str, object]:
+    if CURRENT_DATAFRAME is None:
+        return JSONResponse(status_code=400, content={"error": "Data not found. Please re-upload your file."})
+
+    try:
+        forecast_report = generate_forecast_report(CURRENT_DATAFRAME)
+        return forecast_report
+    except Exception as exc:
+        print(f"DEBUG: {str(exc)}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        logger.exception("Unhandled error in /forecast: %s", exc)
         return JSONResponse(status_code=500, content={"error": str(exc)})
 
 
@@ -193,6 +228,355 @@ def choose_gemini_model_name(available_models: list[str]) -> str:
         preferred_model = GEMINI_MODEL_NAME
 
     return preferred_model.removeprefix("models/")
+
+
+def generate_anomaly_report(dataframe: pd.DataFrame) -> dict[str, object]:
+    prepared_frame = clean_dataframe_for_chat(dataframe)
+    numeric_columns = [column for column in prepared_frame.columns if pd.api.types.is_numeric_dtype(prepared_frame[column])]
+
+    if not numeric_columns:
+        return {
+            "message": "No numeric columns were found, so anomaly detection could not run.",
+            "total_rows": int(len(prepared_frame)),
+            "anomaly_count": 0,
+            "anomalous_rows": [],
+            "insight_cards": generate_insight_cards(prepared_frame),
+            "numeric_columns": [],
+        }
+
+    numeric_frame = prepared_frame[numeric_columns].apply(pd.to_numeric, errors="coerce")
+    for column in numeric_columns:
+        series = numeric_frame[column]
+        fill_value = 0 if series.dropna().empty else float(series.mean())
+        numeric_frame[column] = series.fillna(fill_value)
+
+    if len(prepared_frame) < 2:
+        return {
+            "message": "Not enough rows to detect anomalies.",
+            "total_rows": int(len(prepared_frame)),
+            "anomaly_count": 0,
+            "anomalous_rows": [],
+            "insight_cards": generate_insight_cards(prepared_frame),
+            "numeric_columns": numeric_columns,
+        }
+
+    model = IsolationForest(n_estimators=100, contamination="auto", random_state=42)
+    predictions = model.fit_predict(numeric_frame)
+    scores = model.decision_function(numeric_frame)
+
+    augmented_frame = prepared_frame.copy()
+    augmented_frame["is_anomaly"] = predictions
+    augmented_frame["anomaly_score"] = np.round(scores, 6)
+
+    anomaly_rows = augmented_frame[augmented_frame["is_anomaly"] == -1].copy()
+    if anomaly_rows.empty:
+        return {
+            "message": "No anomalies were detected in the current dataset.",
+            "total_rows": int(len(prepared_frame)),
+            "anomaly_count": 0,
+            "anomalous_rows": [],
+            "insight_cards": generate_insight_cards(prepared_frame),
+            "numeric_columns": numeric_columns,
+        }
+
+    anomaly_rows["anomaly_reason"] = anomaly_rows.apply(
+        lambda row: explain_anomaly_row(row, numeric_frame, numeric_frame.loc[row.name]),
+        axis=1,
+    )
+    anomaly_rows = anomaly_rows.sort_values("anomaly_score").head(20)
+
+    return {
+        "message": f"Detected {len(anomaly_rows)} anomalous rows out of {len(prepared_frame)} total rows.",
+        "total_rows": int(len(prepared_frame)),
+        "anomaly_count": int(len(anomaly_rows)),
+        "anomalous_rows": serialize_records(anomaly_rows),
+        "insight_cards": generate_insight_cards(prepared_frame),
+        "numeric_columns": numeric_columns,
+    }
+
+
+def explain_anomaly_row(row: pd.Series, numeric_frame: pd.DataFrame, numeric_row: pd.Series) -> str:
+    numeric_values = pd.to_numeric(numeric_row, errors="coerce")
+    means = numeric_frame.mean(numeric_only=True)
+    standard_deviation = numeric_frame.std(ddof=0, numeric_only=True).replace(0, np.nan)
+    z_scores = ((numeric_values - means).abs() / standard_deviation).replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    if z_scores.empty or float(z_scores.max()) <= 0:
+        return "Detected as a statistical outlier across the numeric features."
+
+    suspicious_column = str(z_scores.idxmax())
+    suspicious_value = numeric_values.get(suspicious_column)
+    average_value = means.get(suspicious_column)
+
+    if pd.isna(suspicious_value) or pd.isna(average_value):
+        return f"{suspicious_column} is unusual compared to the rest of the dataset."
+
+    if average_value == 0:
+        return f"{suspicious_column} is far from the average value for this dataset."
+
+    multiplier = abs(float(suspicious_value)) / abs(float(average_value))
+    direction = "higher" if float(suspicious_value) >= float(average_value) else "lower"
+    return f"{suspicious_column} is {multiplier:.1f}x {direction} than average."
+
+
+def generate_insight_cards(dataframe: pd.DataFrame) -> list[str]:
+    cards: list[str] = []
+
+    revenue_column = choose_revenue_column(dataframe)
+    category_column = choose_category_column(dataframe)
+    datetime_column = choose_datetime_column(dataframe)
+
+    if revenue_column and category_column:
+        category_totals = (
+            dataframe.groupby(category_column, dropna=False)[revenue_column]
+            .sum()
+            .sort_values(ascending=False)
+        )
+        if not category_totals.empty:
+            total_revenue = float(category_totals.sum())
+            top_category = str(category_totals.index[0])
+            top_value = float(category_totals.iloc[0])
+            share = (top_value / total_revenue) if total_revenue else 0
+            if share > 0.5:
+                cards.append(f"🚩 {top_category} contributed {share:.0%} of total {revenue_column}.")
+            else:
+                cards.append(f"🚩 {top_category} is the largest contributor with {share:.0%} of total {revenue_column}.")
+
+    growth_card = build_growth_card(dataframe, category_column, datetime_column, revenue_column)
+    if growth_card:
+        cards.append(growth_card)
+
+    if revenue_column and category_column:
+        cards.append(f"⚠️ {category_column.title()} '{choose_low_volume_category(dataframe, category_column, revenue_column)}' is underperforming across the dataset.")
+
+    if not cards:
+        cards.append("No strong category-level insights were detected from the current dataset.")
+
+    return cards[:5]
+
+
+def generate_forecast_report(dataframe: pd.DataFrame) -> dict[str, object]:
+    prepared_frame = clean_dataframe_for_chat(dataframe)
+    date_column = choose_datetime_column(prepared_frame)
+    numeric_column = choose_revenue_column(prepared_frame)
+
+    if not date_column:
+        return {
+            "message": "Forecasting requires a Date column in the dataset.",
+            "date_column": None,
+            "numeric_column": numeric_column,
+            "confidence_score": 0,
+            "actual_data": [],
+            "forecast_data": [],
+            "summary_table": [],
+        }
+
+    if not numeric_column:
+        return {
+            "message": "Forecasting requires a numeric column in the dataset.",
+            "date_column": date_column,
+            "numeric_column": None,
+            "confidence_score": 0,
+            "actual_data": [],
+            "forecast_data": [],
+            "summary_table": [],
+        }
+
+    working_frame = prepared_frame[[date_column, numeric_column]].copy()
+    working_frame[date_column] = pd.to_datetime(working_frame[date_column], errors="coerce", format="mixed")
+    working_frame[numeric_column] = pd.to_numeric(working_frame[numeric_column], errors="coerce")
+    working_frame = working_frame.dropna(subset=[date_column, numeric_column])
+
+    if working_frame.empty:
+        return {
+            "message": "Forecasting requires usable Date and Numeric values.",
+            "date_column": date_column,
+            "numeric_column": numeric_column,
+            "confidence_score": 0,
+            "actual_data": [],
+            "forecast_data": [],
+            "summary_table": [],
+        }
+
+    daily_series = (
+        working_frame.assign(__date__=working_frame[date_column].dt.normalize())
+        .groupby("__date__", as_index=False)[numeric_column]
+        .sum()
+        .sort_values("__date__")
+    )
+
+    if len(daily_series) < 2:
+        return {
+            "message": "Forecasting needs at least two dated observations.",
+            "date_column": date_column,
+            "numeric_column": numeric_column,
+            "confidence_score": 0,
+            "actual_data": serialize_forecast_rows(daily_series, numeric_column, "__date__"),
+            "forecast_data": [],
+            "summary_table": [],
+        }
+
+    x_values = (daily_series["__date__"].astype("int64") // 10**9).to_numpy().reshape(-1, 1)
+    y_values = daily_series[numeric_column].to_numpy()
+
+    model = LinearRegression()
+    model.fit(x_values, y_values)
+    confidence_score = float(model.score(x_values, y_values))
+
+    last_date = daily_series["__date__"].max()
+    future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=30, freq="D")
+    future_x = (future_dates.astype("int64") // 10**9).to_numpy().reshape(-1, 1)
+    future_predictions = model.predict(future_x)
+
+    actual_rows = [
+        {"date": serialize_value(date_value), "value": serialize_number(value)}
+        for date_value, value in zip(daily_series["__date__"], daily_series[numeric_column], strict=False)
+    ]
+
+    forecast_rows = [
+        {
+            "date": serialize_value(date_value),
+            "predicted_value": serialize_number(prediction),
+        }
+        for date_value, prediction in zip(future_dates, future_predictions, strict=False)
+    ]
+
+    summary_table = forecast_rows[:10]
+
+    return {
+        "message": f"Forecast generated using {numeric_column} over {date_column}.",
+        "date_column": date_column,
+        "numeric_column": numeric_column,
+        "confidence_score": round(confidence_score, 4),
+        "actual_data": actual_rows,
+        "forecast_data": forecast_rows,
+        "summary_table": summary_table,
+    }
+
+
+def serialize_forecast_rows(dataframe: pd.DataFrame, value_column: str, date_column: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "date": serialize_value(row[date_column]),
+            "value": serialize_number(row[value_column]),
+        }
+        for _, row in dataframe.iterrows()
+    ]
+
+
+def build_growth_card(
+    dataframe: pd.DataFrame,
+    category_column: str | None,
+    datetime_column: str | None,
+    revenue_column: str | None,
+) -> str | None:
+    if not category_column or not datetime_column or not revenue_column:
+        return None
+
+    working_frame = dataframe[[category_column, datetime_column, revenue_column]].copy()
+    working_frame[datetime_column] = pd.to_datetime(working_frame[datetime_column], errors="coerce", format="mixed")
+    working_frame[revenue_column] = pd.to_numeric(working_frame[revenue_column], errors="coerce")
+    working_frame = working_frame.dropna(subset=[datetime_column, category_column, revenue_column])
+
+    if working_frame.empty:
+        return None
+
+    working_frame["period"] = working_frame[datetime_column].dt.to_period("M")
+    period_totals = (
+        working_frame.groupby([category_column, "period"], dropna=False)[revenue_column]
+        .sum()
+        .reset_index()
+        .sort_values([category_column, "period"])
+    )
+
+    best_label = None
+    best_growth = None
+
+    for label, group in period_totals.groupby(category_column):
+        if len(group) < 2:
+            continue
+        start_value = float(group.iloc[0][revenue_column])
+        end_value = float(group.iloc[-1][revenue_column])
+        if start_value == 0:
+            growth = end_value
+        else:
+            growth = (end_value - start_value) / abs(start_value)
+        if best_growth is None or growth > best_growth:
+            best_growth = growth
+            best_label = str(label)
+
+    if best_label is None or best_growth is None:
+        return None
+
+    return f"📈 {best_label} showed the strongest growth trend, rising {best_growth:.0%} over time."
+
+
+def choose_revenue_column(dataframe: pd.DataFrame) -> str | None:
+    preferred_names = ("revenue", "sales", "amount", "value", "total", "profit", "spend", "price")
+    numeric_columns = [column for column in dataframe.columns if pd.api.types.is_numeric_dtype(dataframe[column])]
+
+    for keyword in preferred_names:
+        for column in numeric_columns:
+            if keyword in column.lower():
+                return column
+
+    return numeric_columns[0] if numeric_columns else None
+
+
+def choose_category_column(dataframe: pd.DataFrame) -> str | None:
+    preferred_names = ("product", "category", "segment", "group", "region", "country", "name")
+    categorical_columns = [
+        column
+        for column in dataframe.columns
+        if not pd.api.types.is_numeric_dtype(dataframe[column])
+        and not pd.api.types.is_datetime64_any_dtype(dataframe[column])
+    ]
+
+    for keyword in preferred_names:
+        for column in categorical_columns:
+            if keyword in column.lower():
+                return column
+
+    return categorical_columns[0] if categorical_columns else None
+
+
+def choose_datetime_column(dataframe: pd.DataFrame) -> str | None:
+    for column in dataframe.columns:
+        if pd.api.types.is_datetime64_any_dtype(dataframe[column]):
+            return column
+
+    for column in dataframe.columns:
+        if "date" in column.lower() or "time" in column.lower():
+            return column
+
+    return None
+
+
+def choose_low_volume_category(dataframe: pd.DataFrame, category_column: str, revenue_column: str) -> str:
+    grouped = dataframe.groupby(category_column, dropna=False)[revenue_column].sum().sort_values(ascending=True)
+    if grouped.empty:
+        return "N/A"
+    return str(grouped.index[0])
+
+
+def normalize_chat_result(result: Any) -> Any:
+    if isinstance(result, pd.Series):
+        if result.empty:
+            return ""
+        if len(result) == 1:
+            return normalize_chat_result(result.iloc[0])
+        return result.to_string()
+
+    if isinstance(result, np.generic):
+        native_value = result.item()
+        if isinstance(native_value, numbers.Number):
+            return float(native_value)
+        return native_value
+
+    if isinstance(result, numbers.Number) and not isinstance(result, bool):
+        return float(result)
+
+    return result
 
 
 def analyze_data(dataframe: pd.DataFrame) -> dict[str, object]:

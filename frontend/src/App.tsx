@@ -10,6 +10,8 @@ import {
   type RefObject,
 } from "react";
 import axios from "axios";
+import html2canvas from "html2canvas";
+import { jsPDF } from "jspdf";
 import {
   AlertCircle,
   BarChart3,
@@ -112,6 +114,33 @@ type ChartData = {
   primary_datetime_column: string | null;
   categorical_distributions: Record<string, AggregatedSeries>;
   date_trends: Record<string, AggregatedSeries>;
+};
+
+type AnomalyRow = Record<string, RowValue>;
+
+type AnomalyReport = {
+  message: string;
+  total_rows: number;
+  anomaly_count: number;
+  anomalous_rows: AnomalyRow[];
+  insight_cards: string[];
+  numeric_columns: string[];
+};
+
+type ForecastPoint = {
+  date: string;
+  value?: number;
+  predicted_value?: number;
+};
+
+type ForecastReport = {
+  message: string;
+  date_column: string | null;
+  numeric_column: string | null;
+  confidence_score: number;
+  actual_data: ForecastPoint[];
+  forecast_data: ForecastPoint[];
+  summary_table: ForecastPoint[];
 };
 
 type UploadResponse = {
@@ -227,6 +256,10 @@ export default function App() {
   const [metadata, setMetadata] = useState<SummaryMetric | null>(null);
   const [statistics, setStatistics] = useState<Record<string, ColumnStat>>({});
   const [chartData, setChartData] = useState<ChartData | null>(null);
+  const [anomalyReport, setAnomalyReport] = useState<AnomalyReport | null>(null);
+  const [forecastReport, setForecastReport] = useState<ForecastReport | null>(null);
+  const [activeDatasetTab, setActiveDatasetTab] = useState<"preview" | "anomalies" | "forecast">("preview");
+  const [isExportingReport, setIsExportingReport] = useState(false);
   const [toast, setToast] = useState<ToastState | null>(null);
   const [selectedCategorical, setSelectedCategorical] = useState("");
   const [selectedNumeric, setSelectedNumeric] = useState("");
@@ -244,7 +277,9 @@ export default function App() {
   const barChartRef = useRef<HTMLDivElement | null>(null);
   const pieChartRef = useRef<HTMLDivElement | null>(null);
   const lineChartRef = useRef<HTMLDivElement | null>(null);
+  const forecastChartRef = useRef<HTMLDivElement | null>(null);
   const chatListRef = useRef<HTMLDivElement | null>(null);
+  const dashboardReportRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (!toast) {
@@ -377,6 +412,94 @@ export default function App() {
     }));
   }, [activeDateSeries, selectedNumeric]);
 
+  const anomalyColumns = useMemo(() => {
+    if (!anomalyReport?.anomalous_rows?.length) {
+      return [];
+    }
+
+    return Object.keys(anomalyReport.anomalous_rows[0]);
+  }, [anomalyReport]);
+
+  const aiInsightCards = useMemo(() => anomalyReport?.insight_cards ?? [], [anomalyReport]);
+
+  const forecastChartRows = useMemo(() => {
+    if (!forecastReport) {
+      return [];
+    }
+
+    return [
+      ...forecastReport.actual_data.map((item) => ({
+        date: item.date,
+        actual: item.value ?? null,
+        forecast: null,
+      })),
+      ...forecastReport.forecast_data.map((item) => ({
+        date: item.date,
+        actual: null,
+        forecast: item.predicted_value ?? null,
+      })),
+    ];
+  }, [forecastReport]);
+
+  const handleDownloadFullReport = async () => {
+    if (!dashboardReportRef.current || isExportingReport) {
+      return;
+    }
+
+    setIsExportingReport(true);
+
+    try {
+      const canvas = await html2canvas(dashboardReportRef.current, {
+        scale: 2,
+        useCORS: true,
+        backgroundColor: "#ffffff",
+        scrollY: -window.scrollY,
+      });
+
+      const imageData = canvas.toDataURL("image/png", 1.0);
+      const pdf = new jsPDF("p", "mm", "a4");
+      const pageWidth = pdf.internal.pageSize.getWidth();
+      const pageHeight = pdf.internal.pageSize.getHeight();
+      const margin = 10;
+      const headerHeight = 18;
+      const contentWidth = pageWidth - margin * 2;
+      const contentHeight = pageHeight - margin * 2 - headerHeight;
+      const imageHeight = (canvas.height * contentWidth) / canvas.width;
+
+      let heightLeft = imageHeight;
+      let position = margin + headerHeight;
+
+      const addHeader = () => {
+        pdf.setFillColor(15, 23, 42);
+        pdf.rect(0, 0, pageWidth, 18, "F");
+        pdf.setTextColor(255, 255, 255);
+        pdf.setFontSize(16);
+        pdf.setFont("helvetica", "bold");
+        pdf.text("AI Data Analyst - Automated Business Report", margin, 11);
+        pdf.setFontSize(9);
+        pdf.setFont("helvetica", "normal");
+        pdf.text(`Generated on ${new Date().toLocaleString()}`, pageWidth - margin, 11, { align: "right" });
+        pdf.setTextColor(0, 0, 0);
+      };
+
+      addHeader();
+      pdf.addImage(imageData, "PNG", margin, position, contentWidth, imageHeight);
+      heightLeft -= contentHeight;
+
+      while (heightLeft > 0) {
+        position = heightLeft - imageHeight + margin + headerHeight;
+        pdf.addPage();
+        addHeader();
+        pdf.addImage(imageData, "PNG", margin, position, contentWidth, imageHeight);
+        heightLeft -= contentHeight;
+      }
+
+      pdf.save("ai-data-analyst-report.pdf");
+    } finally {
+      setIsExportingReport(false);
+    }
+  };
+
   const handleUpload = async (selectedFile: File) => {
     setError("");
     setIsUploading(true);
@@ -397,6 +520,47 @@ export default function App() {
       setMetadata(response.data.metadata ?? null);
       setStatistics(response.data.statistics ?? {});
       setChartData(response.data.chart_data ?? null);
+      setActiveDatasetTab("preview");
+
+      try {
+        const anomalyResponse = await axios.get<AnomalyReport>(`${API_BASE_URL}/anomalies`);
+        setAnomalyReport(anomalyResponse.data ?? null);
+      } catch (anomalyError) {
+        const message =
+          axios.isAxiosError(anomalyError) && anomalyError.response?.data?.error
+            ? anomalyError.response.data.error
+            : "Anomaly report is unavailable for this dataset.";
+
+        setAnomalyReport({
+          message,
+          total_rows: response.data.metadata?.total_rows ?? 0,
+          anomaly_count: 0,
+          anomalous_rows: [],
+          insight_cards: [],
+          numeric_columns: response.data.column_groups?.numeric ?? [],
+        });
+      }
+
+      try {
+        const forecastResponse = await axios.get<ForecastReport>(`${API_BASE_URL}/forecast`);
+        setForecastReport(forecastResponse.data ?? null);
+      } catch (forecastError) {
+        const message =
+          axios.isAxiosError(forecastError) && forecastError.response?.data?.error
+            ? forecastError.response.data.error
+            : "Forecast data is unavailable for this dataset.";
+
+        setForecastReport({
+          message,
+          date_column: null,
+          numeric_column: null,
+          confidence_score: 0,
+          actual_data: [],
+          forecast_data: [],
+          summary_table: [],
+        });
+      }
+
       setToast({
         title: "Success",
         message: "Data cleaned, analyzed, and visualized successfully.",
@@ -411,6 +575,8 @@ export default function App() {
       setMetadata(null);
       setStatistics({});
       setChartData(null);
+      setAnomalyReport(null);
+      setForecastReport(null);
       setToast(null);
     } finally {
       setIsUploading(false);
@@ -445,6 +611,9 @@ export default function App() {
     setSelectedCategorical("");
     setSelectedNumeric("");
     setSelectedDatetime("");
+    setAnomalyReport(null);
+    setForecastReport(null);
+    setActiveDatasetTab("preview");
     setToast(null);
 
     if (fileInputRef.current) {
@@ -609,6 +778,15 @@ export default function App() {
               <X className="h-4 w-4" />
               Clear
             </button>
+            <button
+              type="button"
+              onClick={() => void handleDownloadFullReport()}
+              disabled={isExportingReport || rows.length === 0}
+              className="inline-flex items-center gap-2 rounded-full bg-teal-600 px-5 py-3 text-sm font-semibold text-white transition hover:bg-teal-500 disabled:cursor-not-allowed disabled:bg-slate-300"
+            >
+              <Download className="h-4 w-4" />
+              {isExportingReport ? "Preparing PDF..." : "Download Full Report"}
+            </button>
           </div>
 
           {error ? (
@@ -619,6 +797,7 @@ export default function App() {
           ) : null}
         </section>
 
+        <div ref={dashboardReportRef} className="space-y-8">
         <section className="animate-fadeUp rounded-[2rem] border border-white/70 bg-white/90 p-6 shadow-halo backdrop-blur-xl md:p-8">
           <div className="mb-6 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
             <div>
@@ -919,66 +1098,301 @@ export default function App() {
         </section>
 
         <section className="animate-fadeUp rounded-[2rem] border border-white/70 bg-white/90 p-6 shadow-halo backdrop-blur-xl md:p-8">
-          <div className="mb-6 flex items-center justify-between gap-4">
+          <div className="mb-6 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <h3 className="flex items-center gap-2 text-2xl font-semibold tracking-tight text-slate-950">
                 <Table2 className="h-5 w-5 text-teal-600" />
-                Data Preview
+                Dataset Explorer
               </h3>
               <p className="mt-2 text-sm text-slate-500">
-                Showing the first 15 cleaned rows returned by the backend.
+                Switch between the cleaned preview and the anomaly report.
               </p>
             </div>
-            {rows.length > 0 ? (
-              <div className="rounded-full bg-teal-50 px-4 py-2 text-sm font-medium text-teal-800 ring-1 ring-teal-100">
-                {rows.length} row{rows.length === 1 ? "" : "s"} loaded
-              </div>
-            ) : null}
+
+            <div className="inline-flex rounded-full bg-slate-100 p-1 ring-1 ring-slate-200">
+              {[
+                { key: "preview", label: "Data Preview" },
+                { key: "anomalies", label: "Anomaly Report" },
+                { key: "forecast", label: "Future Forecast" },
+              ].map((tab) => (
+                <button
+                  key={tab.key}
+                  type="button"
+                  onClick={() => setActiveDatasetTab(tab.key as "preview" | "anomalies" | "forecast")}
+                  className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+                    activeDatasetTab === tab.key
+                      ? "bg-white text-slate-950 shadow-sm"
+                      : "text-slate-500 hover:text-slate-900"
+                  }`}
+                >
+                  {tab.label}
+                </button>
+              ))}
+            </div>
           </div>
 
-          {rows.length === 0 ? (
-            <div className="flex min-h-72 flex-col items-center justify-center rounded-[1.5rem] border border-dashed border-slate-300 bg-slate-50 text-center">
-              <div className="rounded-full bg-white p-4 shadow-sm ring-1 ring-slate-200">
-                <Table2 className="h-9 w-9 text-slate-400" />
+          {activeDatasetTab === "preview" ? (
+            rows.length === 0 ? (
+              <div className="flex min-h-72 flex-col items-center justify-center rounded-[1.5rem] border border-dashed border-slate-300 bg-slate-50 text-center">
+                <div className="rounded-full bg-white p-4 shadow-sm ring-1 ring-slate-200">
+                  <Table2 className="h-9 w-9 text-slate-400" />
+                </div>
+                <h4 className="mt-5 text-xl font-semibold text-slate-900">No data available</h4>
+                <p className="mt-2 max-w-md text-sm leading-6 text-slate-500">
+                  Upload a file to populate this preview table. The table will update automatically once the backend responds.
+                </p>
               </div>
-              <h4 className="mt-5 text-xl font-semibold text-slate-900">No data available</h4>
-              <p className="mt-2 max-w-md text-sm leading-6 text-slate-500">
-                Upload a file to populate this preview table. The table will update automatically once the backend responds.
-              </p>
-            </div>
-          ) : (
-            <div className="overflow-hidden rounded-[1.5rem] border border-slate-200 bg-white shadow-sm">
-              <div className="overflow-x-auto">
-                <table className="min-w-full divide-y divide-slate-200">
-                  <thead className="bg-slate-50">
-                    <tr>
-                      {columns.map((column) => (
-                        <th
-                          key={column}
-                          scope="col"
-                          className="px-5 py-4 text-left text-xs font-semibold uppercase tracking-[0.18em] text-slate-500"
-                        >
-                          {column}
-                        </th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-100 bg-white">
-                    {rows.map((row, rowIndex) => (
-                      <tr key={`${rowIndex}-${Object.keys(row).join("-")}`} className="transition hover:bg-teal-50/50">
+            ) : (
+              <div className="overflow-hidden rounded-[1.5rem] border border-slate-200 bg-white shadow-sm">
+                <div className="overflow-x-auto">
+                  <table className="min-w-full divide-y divide-slate-200">
+                    <thead className="bg-slate-50">
+                      <tr>
                         {columns.map((column) => (
-                          <td key={column} className="whitespace-nowrap px-5 py-4 text-sm text-slate-700">
-                            {formatCellValue(row[column] ?? null)}
-                          </td>
+                          <th
+                            key={column}
+                            scope="col"
+                            className="px-5 py-4 text-left text-xs font-semibold uppercase tracking-[0.18em] text-slate-500"
+                          >
+                            {column}
+                          </th>
                         ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100 bg-white">
+                      {rows.map((row, rowIndex) => (
+                        <tr key={`${rowIndex}-${Object.keys(row).join("-")}`} className="transition hover:bg-teal-50/50">
+                          {columns.map((column) => (
+                            <td key={column} className="whitespace-nowrap px-5 py-4 text-sm text-slate-700">
+                              {formatCellValue(row[column] ?? null)}
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )
+          ) : activeDatasetTab === "anomalies" ? (
+            <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_320px]">
+              <div className="rounded-[1.5rem] border border-red-200 bg-red-50/50 p-5 shadow-sm">
+                <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-[0.18em] text-red-400">Anomaly Report</p>
+                    <h4 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">
+                      Isolation Forest findings
+                    </h4>
+                  </div>
+                  <div className="rounded-full bg-white px-4 py-2 text-sm font-semibold text-red-700 ring-1 ring-red-200">
+                    {anomalyReport?.anomaly_count ?? 0} flagged row{(anomalyReport?.anomaly_count ?? 0) === 1 ? "" : "s"}
+                  </div>
+                </div>
+
+                <p className="text-sm leading-6 text-slate-600">
+                  {anomalyReport?.message ?? "No anomaly report is available yet."}
+                </p>
+
+                {anomalyReport?.anomalous_rows?.length ? (
+                  <div className="mt-5 overflow-hidden rounded-[1.25rem] border border-red-200 bg-white shadow-sm">
+                    <div className="overflow-x-auto">
+                      <table className="min-w-full divide-y divide-red-100">
+                        <thead className="bg-red-50">
+                          <tr>
+                            {anomalyColumns.map((column) => (
+                              <th
+                                key={column}
+                                scope="col"
+                                className="px-4 py-4 text-left text-xs font-semibold uppercase tracking-[0.18em] text-red-500"
+                              >
+                                {column}
+                              </th>
+                            ))}
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-red-100 bg-white">
+                          {anomalyReport.anomalous_rows.map((row, rowIndex) => (
+                            <tr
+                              key={`${rowIndex}-${Object.keys(row).join("-")}`}
+                              className="bg-red-50/40 transition hover:bg-red-100/70"
+                              title={String(row.anomaly_reason ?? "Why is this an anomaly?")}
+                            >
+                              {anomalyColumns.map((column, columnIndex) => (
+                                <td
+                                  key={column}
+                                  className={`whitespace-nowrap px-4 py-4 text-sm text-slate-700 ${
+                                    columnIndex === 0 ? "border-l-4 border-red-400" : ""
+                                  }`}
+                                >
+                                  {column === "anomaly_reason" ? (
+                                    <span className="inline-flex rounded-full bg-red-100 px-3 py-1 text-xs font-semibold text-red-700">
+                                      Why is this an anomaly?
+                                    </span>
+                                  ) : (
+                                    formatCellValue(row[column] ?? null)
+                                  )}
+                                </td>
+                              ))}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="mt-5 rounded-[1.25rem] border border-dashed border-red-200 bg-white p-6 text-sm leading-6 text-slate-500">
+                    {anomalyReport?.message ?? "Upload a dataset with numeric columns to detect anomalies."}
+                  </div>
+                )}
+              </div>
+
+              <aside className="rounded-[1.5rem] border border-slate-200 bg-white p-5 shadow-sm xl:sticky xl:top-6">
+                <div className="flex items-center gap-2">
+                  <Sparkles className="h-5 w-5 text-indigo-600" />
+                  <h4 className="text-lg font-semibold tracking-tight text-slate-950">AI Insights</h4>
+                </div>
+                <p className="mt-2 text-sm leading-6 text-slate-500">
+                  Short machine-generated notes that highlight extreme winners, losers, and anomaly signals.
+                </p>
+
+                <div className="mt-4 space-y-3">
+                  {aiInsightCards.length > 0 ? (
+                    aiInsightCards.map((insight, index) => (
+                      <div key={`${index}-${insight}`} className="rounded-2xl bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-700 ring-1 ring-slate-200">
+                        {insight}
+                      </div>
+                    ))
+                  ) : (
+                    <div className="rounded-2xl bg-slate-50 px-4 py-3 text-sm leading-6 text-slate-500 ring-1 ring-slate-200">
+                      Upload a dataset with numeric, category, and date columns to see generated insights.
+                    </div>
+                  )}
+                </div>
+
+                <div className="mt-5 rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm text-slate-600">
+                  <p className="font-semibold text-slate-900">Numeric columns used</p>
+                  <p className="mt-2 leading-6">
+                    {anomalyReport?.numeric_columns?.length ? anomalyReport.numeric_columns.join(", ") : "No numeric columns detected."}
+                  </p>
+                </div>
+              </aside>
+            </div>
+          ) : (
+            <div className="space-y-5">
+              <div className="flex flex-col gap-3 rounded-[1.5rem] border border-slate-200 bg-slate-50/70 p-5 shadow-sm md:flex-row md:items-center md:justify-between">
+                <div>
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Future Forecast</p>
+                  <h4 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">
+                    Predicted values for the next 30 periods
+                  </h4>
+                  <p className="mt-2 text-sm leading-6 text-slate-600">
+                    {forecastReport?.message ?? "No forecast available yet."}
+                  </p>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="rounded-2xl bg-white px-4 py-3 ring-1 ring-slate-200">
+                    <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-400">Confidence Score</p>
+                    <p className="mt-2 text-2xl font-semibold text-slate-950">
+                      {formatNumber((forecastReport?.confidence_score ?? 0) * 100)}%
+                    </p>
+                  </div>
+                  <div className="rounded-2xl bg-white px-4 py-3 ring-1 ring-slate-200">
+                    <p className="text-xs font-semibold uppercase tracking-[0.16em] text-slate-400">Columns</p>
+                    <p className="mt-2 text-sm font-semibold text-slate-950">
+                      {forecastReport?.date_column ?? "Date"} / {forecastReport?.numeric_column ?? "Numeric"}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <ChartCard
+                title="Future Forecast"
+                description="Actual data in a solid line and predicted future values in a dashed line."
+                badge={forecastReport?.numeric_column ? `${forecastReport.numeric_column}` : "Forecast"}
+                containerRef={forecastChartRef}
+                onDownload={() => downloadSvgChart(forecastChartRef, "future-forecast.svg")}
+                className=""
+              >
+                {forecastChartRows.length > 0 ? (
+                  <ResponsiveContainer width="100%" height={340}>
+                    <LineChart data={forecastChartRows} margin={{ top: 10, right: 16, left: 4, bottom: 8 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
+                      <XAxis dataKey="date" tick={{ fill: "#475569", fontSize: 12 }} minTickGap={24} />
+                      <YAxis tick={{ fill: "#475569", fontSize: 12 }} />
+                      <Tooltip
+                        contentStyle={{
+                          borderRadius: "16px",
+                          border: "1px solid #e2e8f0",
+                          backgroundColor: "rgba(255,255,255,0.98)",
+                          boxShadow: "0 16px 40px -24px rgba(15,23,42,0.55)",
+                        }}
+                        formatter={(value) => [formatNumber(Number(value)), "Value"]}
+                      />
+                      <Legend />
+                      <Line
+                        type="monotone"
+                        dataKey="actual"
+                        name="Actual"
+                        stroke="#14b8a6"
+                        strokeWidth={3}
+                        dot={{ r: 4, strokeWidth: 2, fill: "#ffffff" }}
+                        connectNulls
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="forecast"
+                        name="Forecast"
+                        stroke="#4f46e5"
+                        strokeDasharray="8 6"
+                        strokeWidth={3}
+                        dot={{ r: 4, strokeWidth: 2, fill: "#ffffff" }}
+                        connectNulls
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                ) : (
+                  <EmptyChartState message="Upload a dataset with a Date column and a numeric column to see the forecast." />
+                )}
+              </ChartCard>
+
+              <div className="rounded-[1.5rem] border border-slate-200 bg-white p-5 shadow-sm">
+                <div className="mb-4 flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Summary Table</p>
+                    <h4 className="mt-2 text-xl font-semibold tracking-tight text-slate-950">Forecast summary</h4>
+                  </div>
+                </div>
+                {forecastReport?.summary_table?.length ? (
+                  <div className="overflow-hidden rounded-[1.25rem] border border-slate-200">
+                    <div className="overflow-x-auto">
+                      <table className="min-w-full divide-y divide-slate-200">
+                        <thead className="bg-slate-50">
+                          <tr>
+                            <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Date</th>
+                            <th className="px-4 py-3 text-left text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">Predicted Value</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100 bg-white">
+                          {forecastReport.summary_table.map((row) => (
+                            <tr key={row.date} className="hover:bg-slate-50">
+                              <td className="px-4 py-3 text-sm text-slate-700">{formatDateValue(row.date)}</td>
+                              <td className="px-4 py-3 text-sm font-medium text-slate-900">{formatNumber(row.predicted_value ?? null)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="rounded-[1.25rem] border border-dashed border-slate-300 bg-slate-50 p-6 text-sm leading-6 text-slate-500">
+                    {forecastReport?.message ?? "Forecast summary is unavailable."}
+                  </div>
+                )}
               </div>
             </div>
           )}
         </section>
+        </div>
       </div>
 
       <aside className="fixed bottom-4 right-4 z-40 w-[min(92vw,380px)] rounded-[1.75rem] border border-slate-200 bg-white/95 shadow-2xl backdrop-blur-xl">
