@@ -10,12 +10,25 @@ from typing import Any
 import pandas as pd
 import numpy as np
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from bson import ObjectId
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from jose import JWTError
+from pydantic import BaseModel, EmailStr
 from sklearn.ensemble import IsolationForest
 from sklearn.linear_model import LinearRegression
+from motor.motor_asyncio import AsyncIOMotorDatabase
+
+from auth import (
+    authenticate_user,
+    create_access_token,
+    get_current_user,
+    get_password_hash,
+    serialize_user,
+)
+from database import close_mongo_connection, connect_to_mongo, get_database
+from schemas import AnalysisReportDetail, AnalysisReportItem, AnalysisSnapshot, AuthResponse, UserCreate, UserLogin
 
 load_dotenv()
 
@@ -38,20 +51,66 @@ if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
 
 CURRENT_DATAFRAME: pd.DataFrame | None = None
+db: AsyncIOMotorDatabase | None = None
 
 app = FastAPI(title="AI Data Analyst Platform", version="1.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+@app.on_event("startup")
+async def startup_event() -> None:
+    global db
+
+    try:
+        db = await connect_to_mongo()
+        if db is None:
+            raise RuntimeError("Local MongoDB is not available")
+
+        await db["users"].create_index("email", unique=True)
+        await db["analysis_reports"].create_index([("user_id", 1), ("timestamp", -1)])
+        print("✅ LOCAL DATABASE CONNECTED SUCCESSFULLY!", flush=True)
+    except Exception as exc:
+        db = None
+        await close_mongo_connection()
+        logger.warning("Local MongoDB startup initialization skipped: %s", exc)
+
+
+@app.on_event("shutdown")
+async def shutdown_event() -> None:
+    global db
+    await close_mongo_connection()
+    db = None
+
+
+async def get_connected_database() -> AsyncIOMotorDatabase:
+    if db is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection failed. Please ensure MongoDB is running on localhost.",
+        )
+
+    return db
+
+
 class ChatRequest(BaseModel):
     user_query: str
+
+
+class UploadResponse(BaseModel):
+    report_id: str
+    filename: str
+    cleaned_data: list[dict[str, Any]]
+    metadata: dict[str, Any]
+    statistics: dict[str, Any]
+    column_groups: dict[str, list[str]]
+    chart_data: dict[str, Any]
 
 
 @app.get("/")
@@ -59,8 +118,49 @@ def health_check() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.post("/auth/register", response_model=AuthResponse)
+@app.post("/register", response_model=AuthResponse)
+async def register_user(payload: UserCreate, db=Depends(get_connected_database)) -> AuthResponse:
+
+    existing_user = await db["users"].find_one({"email": payload.email.lower()})
+    if existing_user:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already registered.")
+
+    user_document = {
+        "name": payload.name.strip(),
+        "email": payload.email.lower(),
+        "password_hash": get_password_hash(payload.password),
+    }
+    result = await db["users"].insert_one(user_document)
+    token = create_access_token(subject=payload.email.lower())
+    user_document["_id"] = result.inserted_id
+
+    return AuthResponse(access_token=token, user=serialize_user(user_document))
+
+
+@app.post("/auth/login", response_model=AuthResponse)
+@app.post("/login", response_model=AuthResponse)
+async def login_user(payload: UserLogin, db=Depends(get_connected_database)) -> AuthResponse:
+
+    user = await authenticate_user(payload.email.lower(), payload.password, db)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password.")
+
+    token = create_access_token(subject=user["email"])
+    return AuthResponse(access_token=token, user=serialize_user(user))
+
+
+@app.get("/me")
+async def get_me(current_user=Depends(get_current_user)) -> dict[str, Any]:
+    return {"user": serialize_user(current_user)}
+
+
 @app.post("/upload")
-async def upload_file(file: UploadFile = File(...)) -> dict[str, object]:
+async def upload_file(
+    file: UploadFile = File(...),
+    current_user=Depends(get_current_user),
+    db=Depends(get_database),
+) -> dict[str, object]:
     filename = file.filename or ""
     suffix = Path(filename).suffix.lower()
 
@@ -74,20 +174,52 @@ async def upload_file(file: UploadFile = File(...)) -> dict[str, object]:
     dataframe = read_tabular_file(file_bytes, suffix)
     analysis = analyze_data(dataframe)
 
-    global CURRENT_DATAFRAME
-    CURRENT_DATAFRAME = clean_dataframe_for_chat(dataframe)
+    report_document = {
+        "user_id": str(current_user["_id"]),
+        "file_name": filename,
+        "summary_stats": {
+            "metadata": analysis["metadata"],
+            "statistics": analysis["statistics"],
+        },
+        "chart_config": analysis["chart_data"],
+        "cleaned_data": analysis["cleaned_data"],
+        "metadata": analysis["metadata"],
+        "statistics": analysis["statistics"],
+        "column_groups": analysis["column_groups"],
+        "timestamp": pd.Timestamp.utcnow().to_pydatetime(),
+    }
+    result = await db["analysis_reports"].insert_one(report_document)
+    report_id = str(result.inserted_id)
 
     return {
+        "report_id": report_id,
         "filename": filename,
         **analysis,
     }
 
 
-@app.post("/chat")
-async def chat_with_data(payload: ChatRequest) -> dict[str, object]:
-    if CURRENT_DATAFRAME is None:
-        return JSONResponse(status_code=400, content={"error": "Data not found. Please re-upload your file."})
+@app.get("/history")
+async def get_history(current_user=Depends(get_current_user), db=Depends(get_database)) -> list[dict[str, Any]]:
+    reports = await db["analysis_reports"].find({"user_id": str(current_user["_id"])}).sort("timestamp", -1).to_list(length=100)
+    return [serialize_history_item(report) for report in reports]
 
+
+@app.get("/history/{report_id}")
+async def get_history_item(report_id: str, current_user=Depends(get_current_user), db=Depends(get_database)) -> dict[str, object]:
+    report = await resolve_active_report(str(current_user["_id"]), db, report_id)
+    if not report:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="History item not found.")
+
+    return build_report_snapshot_response(report)
+
+
+@app.post("/chat")
+async def chat_with_data(
+    payload: ChatRequest,
+    current_user=Depends(get_current_user),
+    db=Depends(get_database),
+    report_id: str | None = Header(default=None, alias="X-Report-Id"),
+) -> dict[str, object]:
     if not GOOGLE_API_KEY:
         return JSONResponse(
             status_code=503,
@@ -95,12 +227,15 @@ async def chat_with_data(payload: ChatRequest) -> dict[str, object]:
         )
 
     try:
+        report = await resolve_active_report(str(current_user["_id"]), db, report_id)
+        if not report:
+            return JSONResponse(status_code=400, content={"error": "Data not found. Please re-upload your file."})
+
+        dataframe = dataframe_from_report(report)
         available_models = discover_available_gemini_models()
         print(f"DEBUG: Available models for this key: {available_models}", flush=True)
         model_name = choose_gemini_model_name(available_models)
         print(f"DEBUG: Selected Gemini model: {model_name}", flush=True)
-
-        dataframe = CURRENT_DATAFRAME
         column_names = list(dataframe.columns)
         system_prompt = (
             "You are a data analyst. Use ONLY the provided 'df'. "
@@ -173,12 +308,17 @@ async def chat_with_data(payload: ChatRequest) -> dict[str, object]:
 
 
 @app.get("/anomalies")
-async def get_anomalies() -> dict[str, object]:
-    if CURRENT_DATAFRAME is None:
-        return JSONResponse(status_code=400, content={"error": "Data not found. Please re-upload your file."})
-
+async def get_anomalies(
+    current_user=Depends(get_current_user),
+    db=Depends(get_database),
+    report_id: str | None = Header(default=None, alias="X-Report-Id"),
+) -> dict[str, object]:
     try:
-        report = generate_anomaly_report(CURRENT_DATAFRAME)
+        report_doc = await resolve_active_report(str(current_user["_id"]), db, report_id)
+        if not report_doc:
+            return JSONResponse(status_code=400, content={"error": "Data not found. Please re-upload your file."})
+
+        report = generate_anomaly_report(dataframe_from_report(report_doc))
         return report
     except Exception as exc:
         print(f"DEBUG: {str(exc)}", flush=True)
@@ -188,18 +328,63 @@ async def get_anomalies() -> dict[str, object]:
 
 
 @app.get("/forecast")
-async def get_forecast() -> dict[str, object]:
-    if CURRENT_DATAFRAME is None:
-        return JSONResponse(status_code=400, content={"error": "Data not found. Please re-upload your file."})
-
+async def get_forecast(
+    current_user=Depends(get_current_user),
+    db=Depends(get_database),
+    report_id: str | None = Header(default=None, alias="X-Report-Id"),
+) -> dict[str, object]:
     try:
-        forecast_report = generate_forecast_report(CURRENT_DATAFRAME)
+        report_doc = await resolve_active_report(str(current_user["_id"]), db, report_id)
+        if not report_doc:
+            return JSONResponse(status_code=400, content={"error": "Data not found. Please re-upload your file."})
+
+        forecast_report = generate_forecast_report(dataframe_from_report(report_doc))
         return forecast_report
     except Exception as exc:
         print(f"DEBUG: {str(exc)}", flush=True)
         print(traceback.format_exc(), flush=True)
         logger.exception("Unhandled error in /forecast: %s", exc)
         return JSONResponse(status_code=500, content={"error": str(exc)})
+
+
+def dataframe_from_report(report_document: dict[str, Any]) -> pd.DataFrame:
+    return pd.DataFrame(report_document.get("cleaned_data", []))
+
+
+async def resolve_active_report(user_id: str, db, report_id: str | None = None) -> dict[str, Any] | None:
+    if report_id:
+        try:
+            object_id = ObjectId(report_id)
+        except Exception:
+            return None
+
+        return await db["analysis_reports"].find_one({"_id": object_id, "user_id": user_id})
+
+    return await db["analysis_reports"].find_one({"user_id": user_id}, sort=[("timestamp", -1)])
+
+
+def serialize_history_item(report_document: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "id": str(report_document["_id"]),
+        "file_name": report_document["file_name"],
+        "summary_stats": report_document.get("summary_stats", {}),
+        "chart_config": report_document.get("chart_config", {}),
+        "timestamp": serialize_value(report_document.get("timestamp")),
+    }
+
+
+def build_report_snapshot_response(report_document: dict[str, Any]) -> dict[str, object]:
+    return {
+        "report_id": str(report_document["_id"]),
+        "file_name": report_document["file_name"],
+        "cleaned_data": report_document.get("cleaned_data", []),
+        "metadata": report_document.get("metadata", {}),
+        "statistics": report_document.get("statistics", {}),
+        "column_groups": report_document.get("column_groups", {}),
+        "chart_data": report_document.get("chart_config", {}),
+        "summary_stats": report_document.get("summary_stats", {}),
+        "timestamp": serialize_value(report_document.get("timestamp")),
+    }
 
 
 def discover_available_gemini_models() -> list[str]:

@@ -3,9 +3,9 @@ import {
   useMemo,
   useRef,
   useState,
-  type FormEvent,
   type ChangeEvent,
   type DragEvent,
+  type FormEvent,
   type ReactNode,
   type RefObject,
 } from "react";
@@ -15,8 +15,9 @@ import { jsPDF } from "jspdf";
 import {
   AlertCircle,
   BarChart3,
-  CheckCircle2,
+  Bot,
   CalendarClock,
+  CheckCircle2,
   ChevronDown,
   Columns3,
   Database,
@@ -25,15 +26,14 @@ import {
   Hash,
   Loader2,
   MessageSquare,
-  Send,
-  Bot,
-  User,
   PieChart as PieChartIcon,
+  Send,
   Sparkles,
   Table2,
   TrendingDown,
   TrendingUp,
   UploadCloud,
+  User,
   X,
   type LucideIcon,
 } from "lucide-react";
@@ -42,6 +42,7 @@ import {
   BarChart,
   CartesianGrid,
   Cell,
+  LabelList,
   Legend,
   Line,
   LineChart,
@@ -51,7 +52,6 @@ import {
   Tooltip,
   XAxis,
   YAxis,
-  LabelList,
 } from "recharts";
 
 type RowValue = string | number | boolean | null;
@@ -143,7 +143,36 @@ type ForecastReport = {
   summary_table: ForecastPoint[];
 };
 
+type UserProfile = {
+  id: string;
+  name: string;
+  email: string;
+};
+
+type AuthResponse = {
+  access_token: string;
+  token_type: string;
+  user: UserProfile;
+};
+
+type HistoryItem = {
+  id: string;
+  file_name: string;
+  summary_stats: Record<string, unknown>;
+  chart_config: ChartData;
+  timestamp: string;
+};
+
+type SnapshotResponse = UploadResponse & {
+  report_id: string;
+  file_name?: string;
+  filename?: string;
+  summary_stats: Record<string, unknown>;
+  timestamp: string;
+};
+
 type UploadResponse = {
+  report_id: string;
   filename: string;
   cleaned_data: Row[];
   metadata: SummaryMetric;
@@ -248,6 +277,14 @@ function downloadSvgChart(containerRef: RefObject<HTMLDivElement>, filename: str
 }
 
 export default function App() {
+  const [authToken, setAuthToken] = useState<string>(() => localStorage.getItem("authToken") ?? "");
+  const [currentUser, setCurrentUser] = useState<UserProfile | null>(() => {
+    const storedUser = localStorage.getItem("authUser");
+    return storedUser ? (JSON.parse(storedUser) as UserProfile) : null;
+  });
+  const [authLoading, setAuthLoading] = useState(true);
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [authForm, setAuthForm] = useState({ name: "", email: "", password: "" });
   const [file, setFile] = useState<File | null>(null);
   const [rows, setRows] = useState<Row[]>([]);
   const [fileName, setFileName] = useState("");
@@ -260,10 +297,16 @@ export default function App() {
   const [forecastReport, setForecastReport] = useState<ForecastReport | null>(null);
   const [activeDatasetTab, setActiveDatasetTab] = useState<"preview" | "anomalies" | "forecast">("preview");
   const [isExportingReport, setIsExportingReport] = useState(false);
+  const [historyItems, setHistoryItems] = useState<HistoryItem[]>([]);
+  const [currentReportId, setCurrentReportId] = useState<string>(() => localStorage.getItem("currentReportId") ?? "");
+  const [isProfileMenuOpen, setIsProfileMenuOpen] = useState(false);
+  const [isSavingAuth, setIsSavingAuth] = useState(false);
+  const [authError, setAuthError] = useState("");
   const [toast, setToast] = useState<ToastState | null>(null);
   const [selectedCategorical, setSelectedCategorical] = useState("");
   const [selectedNumeric, setSelectedNumeric] = useState("");
   const [selectedDatetime, setSelectedDatetime] = useState("");
+  const [isChatOpen, setIsChatOpen] = useState(false);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
     {
       id: 1,
@@ -280,6 +323,54 @@ export default function App() {
   const forecastChartRef = useRef<HTMLDivElement | null>(null);
   const chatListRef = useRef<HTMLDivElement | null>(null);
   const dashboardReportRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!authToken) {
+      setAuthLoading(false);
+      return;
+    }
+
+    const restoreSession = async () => {
+      try {
+        const meResponse = await axios.get<{ user: UserProfile }>(`${API_BASE_URL}/me`, {
+          headers: getAuthHeaders(authToken, currentReportId),
+        });
+        setCurrentUser(meResponse.data.user);
+        localStorage.setItem("authUser", JSON.stringify(meResponse.data.user));
+        await refreshHistory(authToken, currentReportId, meResponse.data.user);
+      } catch {
+        handleLogout(false);
+      } finally {
+        setAuthLoading(false);
+      }
+    };
+
+    void restoreSession();
+  }, []);
+
+  useEffect(() => {
+    if (authToken) {
+      localStorage.setItem("authToken", authToken);
+    } else {
+      localStorage.removeItem("authToken");
+    }
+  }, [authToken]);
+
+  useEffect(() => {
+    if (currentUser) {
+      localStorage.setItem("authUser", JSON.stringify(currentUser));
+    } else {
+      localStorage.removeItem("authUser");
+    }
+  }, [currentUser]);
+
+  useEffect(() => {
+    if (currentReportId) {
+      localStorage.setItem("currentReportId", currentReportId);
+    } else {
+      localStorage.removeItem("currentReportId");
+    }
+  }, [currentReportId]);
 
   useEffect(() => {
     if (!toast) {
@@ -422,6 +513,142 @@ export default function App() {
 
   const aiInsightCards = useMemo(() => anomalyReport?.insight_cards ?? [], [anomalyReport]);
 
+  function getAuthHeaders(token = authToken, reportId = currentReportId) {
+    const headers: Record<string, string> = {};
+
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+
+    if (reportId) {
+      headers["X-Report-Id"] = reportId;
+    }
+
+    return headers;
+  }
+
+  async function refreshHistory(token = authToken, reportId = currentReportId, user = currentUser) {
+    if (!token || !user) {
+      setHistoryItems([]);
+      return;
+    }
+
+    const response = await axios.get<HistoryItem[]>(`${API_BASE_URL}/history`, {
+      headers: getAuthHeaders(token, reportId),
+    });
+    setHistoryItems(response.data ?? []);
+  }
+
+  async function refreshDerivedReports(reportId = currentReportId) {
+    if (!authToken || !reportId) {
+      return;
+    }
+
+    const headers = getAuthHeaders(authToken, reportId);
+    const [anomalyResponse, forecastResponse] = await Promise.allSettled([
+      axios.get<AnomalyReport>(`${API_BASE_URL}/anomalies`, { headers }),
+      axios.get<ForecastReport>(`${API_BASE_URL}/forecast`, { headers }),
+    ]);
+
+    if (anomalyResponse.status === "fulfilled") {
+      setAnomalyReport(anomalyResponse.value.data ?? null);
+    }
+
+    if (forecastResponse.status === "fulfilled") {
+      setForecastReport(forecastResponse.value.data ?? null);
+    }
+  }
+
+  function applySnapshot(snapshot: SnapshotResponse, reportId: string) {
+    setRows(snapshot.cleaned_data ?? []);
+    setFileName(snapshot.file_name ?? snapshot.filename ?? "");
+    setMetadata(snapshot.metadata ?? null);
+    setStatistics(snapshot.statistics ?? {});
+    setChartData(snapshot.chart_data ?? null);
+    setActiveDatasetTab("preview");
+    setCurrentReportId(reportId);
+  }
+
+  async function handleLoadHistory(reportId: string) {
+    if (!authToken) {
+      return;
+    }
+
+    const response = await axios.get<SnapshotResponse>(`${API_BASE_URL}/history/${reportId}`, {
+      headers: getAuthHeaders(authToken, reportId),
+    });
+    applySnapshot(response.data, reportId);
+    await refreshDerivedReports(reportId);
+  }
+
+  async function handleLogout(clearServerSession = true) {
+    setAuthToken("");
+    setCurrentUser(null);
+    setHistoryItems([]);
+    setCurrentReportId("");
+    setAuthError("");
+    setAuthMode("login");
+    setIsProfileMenuOpen(false);
+    setRows([]);
+    setFileName("");
+    setMetadata(null);
+    setStatistics({});
+    setChartData(null);
+    setAnomalyReport(null);
+    setForecastReport(null);
+    setToast(null);
+
+    if (clearServerSession) {
+      localStorage.removeItem("authToken");
+      localStorage.removeItem("authUser");
+      localStorage.removeItem("currentReportId");
+    }
+
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+    }
+  }
+
+  async function handleAuthSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setAuthError("");
+    setIsSavingAuth(true);
+
+    try {
+      const endpoint = authMode === "register" ? "/auth/register" : "/auth/login";
+      const payload =
+        authMode === "register"
+          ? {
+              name: authForm.name,
+              email: authForm.email,
+              password: authForm.password,
+            }
+          : {
+              email: authForm.email,
+              password: authForm.password,
+            };
+
+      const response = await axios.post<AuthResponse>(`${API_BASE_URL}${endpoint}`, payload);
+      setAuthToken(response.data.access_token);
+      setCurrentUser(response.data.user);
+      localStorage.setItem("authToken", response.data.access_token);
+      localStorage.setItem("authUser", JSON.stringify(response.data.user));
+      await refreshHistory(response.data.access_token, currentReportId, response.data.user);
+      setToast({
+        title: authMode === "register" ? "Account created" : "Logged in",
+        message: `Welcome back, ${response.data.user.name}.`,
+      });
+    } catch (requestError) {
+      const message =
+        axios.isAxiosError(requestError) && (requestError.response?.data?.detail || requestError.response?.data?.error)
+          ? requestError.response.data.detail || requestError.response.data.error
+          : "Authentication failed. Please try again.";
+      setAuthError(message);
+    } finally {
+      setIsSavingAuth(false);
+    }
+  }
+
   const forecastChartRows = useMemo(() => {
     if (!forecastReport) {
       return [];
@@ -513,17 +740,23 @@ export default function App() {
       const response = await axios.post<UploadResponse>(`${API_BASE_URL}/upload`, formData, {
         headers: {
           "Content-Type": "multipart/form-data",
+          ...getAuthHeaders(),
         },
       });
+      const uploadedReportId = response.data.report_id ?? "";
 
       setRows(response.data.cleaned_data ?? []);
       setMetadata(response.data.metadata ?? null);
       setStatistics(response.data.statistics ?? {});
       setChartData(response.data.chart_data ?? null);
       setActiveDatasetTab("preview");
+      setCurrentReportId(uploadedReportId);
+      await refreshHistory(authToken, uploadedReportId, currentUser);
 
       try {
-        const anomalyResponse = await axios.get<AnomalyReport>(`${API_BASE_URL}/anomalies`);
+        const anomalyResponse = await axios.get<AnomalyReport>(`${API_BASE_URL}/anomalies`, {
+          headers: getAuthHeaders(authToken, uploadedReportId),
+        });
         setAnomalyReport(anomalyResponse.data ?? null);
       } catch (anomalyError) {
         const message =
@@ -542,7 +775,9 @@ export default function App() {
       }
 
       try {
-        const forecastResponse = await axios.get<ForecastReport>(`${API_BASE_URL}/forecast`);
+        const forecastResponse = await axios.get<ForecastReport>(`${API_BASE_URL}/forecast`, {
+          headers: getAuthHeaders(authToken, uploadedReportId),
+        });
         setForecastReport(forecastResponse.data ?? null);
       } catch (forecastError) {
         const message =
@@ -640,6 +875,8 @@ export default function App() {
     try {
       const response = await axios.post<ChatResponse>(`${API_BASE_URL}/chat`, {
         user_query: trimmedQuery,
+      }, {
+        headers: getAuthHeaders(),
       });
 
       const answer = renderChatResult(response.data.result);
@@ -674,6 +911,176 @@ export default function App() {
     event.preventDefault();
     await sendChatMessage();
   };
+
+  const handleToggleChat = () => {
+    setIsChatOpen((current) => !current);
+  };
+
+  const isAuthenticated = Boolean(authToken && currentUser);
+
+  const authPage = (
+    <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(15,118,110,0.2),_transparent_30%),linear-gradient(180deg,_#f8fafc_0%,_#e0f2fe_100%)] px-4 py-10 text-slate-900">
+      {toast ? (
+        <div className="fixed right-4 top-4 z-50 w-full max-w-sm rounded-2xl border border-emerald-200 bg-white/95 p-4 shadow-2xl backdrop-blur-xl">
+          <div className="flex items-start gap-3">
+            <div className="rounded-full bg-emerald-100 p-2 text-emerald-700">
+              <CheckCircle2 className="h-5 w-5" />
+            </div>
+            <div className="min-w-0 flex-1">
+              <p className="text-sm font-semibold text-slate-900">{toast.title}</p>
+              <p className="mt-1 text-sm leading-6 text-slate-600">{toast.message}</p>
+            </div>
+            <button
+              type="button"
+              className="rounded-full p-1 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
+              onClick={() => setToast(null)}
+              aria-label="Dismiss notification"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+      ) : null}
+
+      <div className="mx-auto grid min-h-[calc(100vh-5rem)] w-full max-w-6xl gap-8 lg:grid-cols-[1.1fr_0.9fr] lg:items-center">
+        <section className="animate-fadeUp rounded-[2rem] border border-white/70 bg-white/90 p-8 shadow-halo backdrop-blur-xl md:p-10">
+          <p className="mb-3 inline-flex items-center gap-2 rounded-full bg-teal-100 px-4 py-2 text-sm font-semibold text-teal-800">
+            <Sparkline />
+            Secure multi-user analytics
+          </p>
+          <h1 className="text-4xl font-semibold tracking-tight text-slate-950 md:text-5xl">
+            AI Data Analyst Platform
+          </h1>
+          <p className="mt-4 max-w-xl text-base leading-7 text-slate-600 md:text-lg">
+            Sign in to upload spreadsheets, analyze data, chat with Gemini, and save every analysis to your project history.
+          </p>
+
+          <div className="mt-8 grid gap-4 sm:grid-cols-2">
+            {[
+              { title: "Protected workspace", text: "JWT-backed sessions keep each user’s uploads and history isolated." },
+              { title: "Instant dashboards", text: "Upload CSV or Excel files and see cleaned data, charts, and insights." },
+              { title: "AI chat", text: "Ask follow-up questions about the active dataset with bearer-authenticated requests." },
+              { title: "Project history", text: "Reload previous analyses from MongoDB without re-uploading the file." },
+            ].map((item) => (
+              <div key={item.title} className="rounded-[1.5rem] border border-slate-200 bg-slate-50 p-4 shadow-sm">
+                <p className="text-sm font-semibold text-slate-950">{item.title}</p>
+                <p className="mt-2 text-sm leading-6 text-slate-500">{item.text}</p>
+              </div>
+            ))}
+          </div>
+        </section>
+
+        <section className="animate-fadeUp rounded-[2rem] border border-white/70 bg-white/90 p-8 shadow-halo backdrop-blur-xl md:p-10">
+          <div className="flex items-center justify-between gap-3">
+            <div>
+              <p className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">Authentication</p>
+              <h2 className="mt-2 text-3xl font-semibold tracking-tight text-slate-950">
+                {authMode === "register" ? "Create your account" : "Welcome back"}
+              </h2>
+            </div>
+            <div className="rounded-2xl bg-slate-50 px-4 py-3 text-right text-xs text-slate-500 ring-1 ring-slate-200">
+              <p className="font-semibold text-slate-900">Secure access</p>
+              <p className="mt-1">Token stored in localStorage</p>
+            </div>
+          </div>
+
+          <div className="mt-6 inline-flex rounded-full bg-slate-100 p-1 ring-1 ring-slate-200">
+            <button
+              type="button"
+              onClick={() => setAuthMode("login")}
+              className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+                authMode === "login" ? "bg-white text-slate-950 shadow-sm" : "text-slate-500 hover:text-slate-900"
+              }`}
+            >
+              Login
+            </button>
+            <button
+              type="button"
+              onClick={() => setAuthMode("register")}
+              className={`rounded-full px-4 py-2 text-sm font-semibold transition ${
+                authMode === "register" ? "bg-white text-slate-950 shadow-sm" : "text-slate-500 hover:text-slate-900"
+              }`}
+            >
+              Sign Up
+            </button>
+          </div>
+
+          <form className="mt-6 space-y-4" onSubmit={handleAuthSubmit}>
+            {authMode === "register" ? (
+              <label className="block">
+                <span className="text-sm font-medium text-slate-700">Name</span>
+                <input
+                  type="text"
+                  value={authForm.name}
+                  onChange={(event) => setAuthForm((current) => ({ ...current, name: event.target.value }))}
+                  className="mt-2 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm outline-none transition focus:border-teal-400 focus:bg-white"
+                  placeholder="Your name"
+                  required
+                />
+              </label>
+            ) : null}
+
+            <label className="block">
+              <span className="text-sm font-medium text-slate-700">Email</span>
+              <input
+                type="email"
+                value={authForm.email}
+                onChange={(event) => setAuthForm((current) => ({ ...current, email: event.target.value }))}
+                className="mt-2 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm outline-none transition focus:border-teal-400 focus:bg-white"
+                placeholder="you@example.com"
+                required
+              />
+            </label>
+
+            <label className="block">
+              <span className="text-sm font-medium text-slate-700">Password</span>
+              <input
+                type="password"
+                value={authForm.password}
+                onChange={(event) => setAuthForm((current) => ({ ...current, password: event.target.value }))}
+                className="mt-2 w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm outline-none transition focus:border-teal-400 focus:bg-white"
+                placeholder="••••••••"
+                minLength={8}
+                required
+              />
+            </label>
+
+            {authError ? (
+              <div className="rounded-2xl border border-red-200 bg-red-50 px-4 py-3 text-sm leading-6 text-red-700">
+                {authError}
+              </div>
+            ) : null}
+
+            <button
+              type="submit"
+              disabled={isSavingAuth}
+              className="inline-flex w-full items-center justify-center gap-2 rounded-2xl bg-slate-950 px-5 py-3.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-400"
+            >
+              {isSavingAuth ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              {isSavingAuth ? "Please wait..." : authMode === "register" ? "Create account" : "Login"}
+            </button>
+          </form>
+        </section>
+      </div>
+    </main>
+  );
+
+  if (authLoading) {
+    return (
+      <main className="flex min-h-screen items-center justify-center bg-[radial-gradient(circle_at_top,_rgba(15,118,110,0.18),_transparent_28%),linear-gradient(180deg,_#f8fafc_0%,_#eef2ff_100%)] px-4 text-slate-900">
+        <div className="rounded-3xl border border-white/70 bg-white/90 px-6 py-5 shadow-halo backdrop-blur-xl">
+          <div className="flex items-center gap-3 text-sm font-medium text-slate-700">
+            <Loader2 className="h-4 w-4 animate-spin text-teal-600" />
+            Restoring your session...
+          </div>
+        </div>
+      </main>
+    );
+  }
+
+  if (!isAuthenticated) {
+    return authPage;
+  }
 
   return (
     <main className="min-h-screen bg-[radial-gradient(circle_at_top,_rgba(15,118,110,0.18),_transparent_28%),linear-gradient(180deg,_#f8fafc_0%,_#eef2ff_100%)] px-4 py-10 text-slate-900">
@@ -716,12 +1123,46 @@ export default function App() {
               </p>
             </div>
 
-            <div className="rounded-2xl border border-slate-200 bg-slate-50 px-5 py-4 text-sm text-slate-600 shadow-sm">
-              <div className="flex items-center gap-2 font-medium text-slate-900">
-                <FileSpreadsheet className="h-4 w-4 text-teal-600" />
-                Supported formats
+            <div className="flex flex-col gap-3">
+              <div className="rounded-2xl border border-slate-200 bg-slate-50 px-5 py-4 text-sm text-slate-600 shadow-sm">
+                <div className="flex items-center gap-2 font-medium text-slate-900">
+                  <FileSpreadsheet className="h-4 w-4 text-teal-600" />
+                  Supported formats
+                </div>
+                <p className="mt-2">CSV, XLS, XLSX</p>
               </div>
-              <p className="mt-2">CSV, XLS, XLSX</p>
+
+              <div className="relative rounded-2xl border border-slate-200 bg-white px-5 py-4 text-sm shadow-sm">
+                <button
+                  type="button"
+                  onClick={() => setIsProfileMenuOpen((current) => !current)}
+                  className="flex w-full items-center justify-between gap-3 text-left"
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="rounded-2xl bg-indigo-50 p-2 text-indigo-700 ring-1 ring-indigo-100">
+                      <User className="h-4 w-4" />
+                    </div>
+                    <div>
+                      <p className="font-semibold text-slate-950">{currentUser?.name ?? "Profile"}</p>
+                      <p className="text-xs text-slate-500">{currentUser?.email ?? "Signed in"}</p>
+                    </div>
+                  </div>
+                  <ChevronDown className={`h-4 w-4 text-slate-400 transition ${isProfileMenuOpen ? "rotate-180" : ""}`} />
+                </button>
+
+                {isProfileMenuOpen ? (
+                  <div className="absolute right-0 top-[calc(100%+0.5rem)] z-20 w-full rounded-2xl border border-slate-200 bg-white p-2 shadow-2xl">
+                    <button
+                      type="button"
+                      onClick={() => void handleLogout()}
+                      className="flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-slate-700 transition hover:bg-slate-50 hover:text-slate-950"
+                    >
+                      <X className="h-4 w-4" />
+                      Logout
+                    </button>
+                  </div>
+                ) : null}
+              </div>
             </div>
           </div>
 
@@ -798,7 +1239,7 @@ export default function App() {
         </section>
 
         <div ref={dashboardReportRef} className="space-y-8">
-        <section className="animate-fadeUp rounded-[2rem] border border-white/70 bg-white/90 p-6 shadow-halo backdrop-blur-xl md:p-8">
+        <section className={`animate-fadeUp rounded-[2rem] border border-white/70 bg-white/90 p-6 shadow-halo backdrop-blur-xl md:p-8 ${rows.length > 0 ? "" : "hidden"}`}>
           <div className="mb-6 flex flex-col gap-3 md:flex-row md:items-end md:justify-between">
             <div>
               <h3 className="flex items-center gap-2 text-2xl font-semibold tracking-tight text-slate-950">
@@ -1056,7 +1497,7 @@ export default function App() {
                           <p className="text-sm font-medium text-slate-600">Top values</p>
                           <div className="mt-3 flex flex-wrap gap-2">
                             {stat.top_values.length > 0 ? (
-                              stat.top_values.map((item) => (
+                              stat.top_values.map((item: { value: string; frequency: number }) => (
                                 <span
                                   key={`${columnName}-${item.value}`}
                                   className="inline-flex items-center gap-2 rounded-full bg-white px-3 py-2 text-sm font-medium text-slate-700 ring-1 ring-slate-200"
@@ -1097,7 +1538,7 @@ export default function App() {
           )}
         </section>
 
-        <section className="animate-fadeUp rounded-[2rem] border border-white/70 bg-white/90 p-6 shadow-halo backdrop-blur-xl md:p-8">
+        <section className={`animate-fadeUp rounded-[2rem] border border-white/70 bg-white/90 p-6 shadow-halo backdrop-blur-xl md:p-8 ${rows.length > 0 ? "" : "hidden"}`}>
           <div className="mb-6 flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <h3 className="flex items-center gap-2 text-2xl font-semibold tracking-tight text-slate-950">
@@ -1395,61 +1836,82 @@ export default function App() {
         </div>
       </div>
 
-      <aside className="fixed bottom-4 right-4 z-40 w-[min(92vw,380px)] rounded-[1.75rem] border border-slate-200 bg-white/95 shadow-2xl backdrop-blur-xl">
-        <div className="flex items-center justify-between border-b border-slate-200 px-4 py-4">
-          <div className="flex items-center gap-3">
-            <div className="rounded-2xl bg-indigo-600 p-2 text-white shadow-sm">
-              <MessageSquare className="h-5 w-5" />
-            </div>
-            <div>
-              <p className="text-sm font-semibold text-slate-950">Chat with your Data</p>
-              <p className="text-xs text-slate-500">Gemini-powered analysis assistant</p>
-            </div>
-          </div>
-          <span className="rounded-full bg-indigo-50 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-indigo-700">
-            AI Chat
-          </span>
-        </div>
+      <button
+        type="button"
+        onClick={handleToggleChat}
+        className="fixed bottom-8 right-8 z-50 inline-flex h-16 w-16 items-center justify-center rounded-full bg-indigo-600 text-white shadow-2xl transition hover:scale-105 hover:bg-indigo-500"
+        aria-label={isChatOpen ? "Close chat" : "Open chat"}
+      >
+        {isChatOpen ? <X className="h-6 w-6" /> : <MessageSquare className="h-6 w-6" />}
+      </button>
 
-        <div ref={chatListRef} className="max-h-[360px] space-y-3 overflow-y-auto px-4 py-4">
-          {chatMessages.map((message) => (
-            <ChatBubble key={message.id} message={message} />
-          ))}
-          {isChatting ? (
-            <div className="flex items-start gap-3">
-              <div className="rounded-2xl bg-indigo-100 p-2 text-indigo-700">
-                <Bot className="h-4 w-4" />
+      {isChatOpen ? (
+        <aside className="fixed bottom-24 right-8 z-50 flex h-[600px] max-h-[80vh] w-[400px] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-2xl">
+          <div className="flex items-center justify-between border-b border-slate-200 px-4 py-4">
+            <div className="flex items-center gap-3">
+              <div className="rounded-2xl bg-indigo-600 p-2 text-white shadow-sm">
+                <MessageSquare className="h-5 w-5" />
               </div>
-              <div className="rounded-3xl rounded-tl-sm bg-slate-100 px-4 py-3 text-sm text-slate-600 shadow-sm">
-                Typing...
+              <div>
+                <p className="text-sm font-semibold text-slate-950">Chat with your Data</p>
+                <p className="text-xs text-slate-500">Gemini-powered analysis assistant</p>
               </div>
             </div>
-          ) : null}
-        </div>
-
-        <form onSubmit={handleChatSubmit} className="border-t border-slate-200 p-4">
-          <div className="flex items-end gap-2 rounded-[1.25rem] border border-slate-200 bg-slate-50 px-3 py-3 shadow-sm focus-within:border-indigo-400 focus-within:bg-white">
-            <textarea
-              value={chatInput}
-              onChange={(event) => setChatInput(event.target.value)}
-              placeholder={rows.length > 0 ? "Ask about your data..." : "Upload a file first to start chatting..."}
-              rows={2}
-              disabled={rows.length === 0 || isUploading}
-              className="min-h-[48px] flex-1 resize-none bg-transparent text-sm text-slate-800 outline-none placeholder:text-slate-400 disabled:cursor-not-allowed"
-            />
-            <button
-              type="submit"
-              disabled={!chatInput.trim() || rows.length === 0 || isChatting || isUploading}
-              className="inline-flex h-11 w-11 items-center justify-center rounded-2xl bg-indigo-600 text-white transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-300"
-            >
-              <Send className="h-4 w-4" />
-            </button>
+            <div className="flex items-center gap-2">
+              <span className="rounded-full bg-indigo-50 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-indigo-700">
+                AI Chat
+              </span>
+              <button
+                type="button"
+                onClick={handleToggleChat}
+                className="rounded-full p-2 text-slate-500 transition hover:bg-slate-100 hover:text-slate-900"
+                aria-label="Close chat"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
           </div>
-          <p className="mt-2 text-[11px] leading-5 text-slate-500">
-            Ask natural language questions like “What are the top categories?” or “Show the average sales by day.”
-          </p>
-        </form>
-      </aside>
+
+          <div ref={chatListRef} className="flex-1 space-y-3 overflow-y-auto px-4 py-4">
+            {chatMessages.map((message) => (
+              <ChatBubble key={message.id} message={message} />
+            ))}
+            {isChatting ? (
+              <div className="flex items-start gap-3">
+                <div className="rounded-2xl bg-indigo-100 p-2 text-indigo-700">
+                  <Bot className="h-4 w-4" />
+                </div>
+                <div className="rounded-3xl rounded-tl-sm bg-slate-100 px-4 py-3 text-sm text-slate-600 shadow-sm">
+                  Typing...
+                </div>
+              </div>
+            ) : null}
+          </div>
+
+          <form onSubmit={handleChatSubmit} className="border-t border-slate-200 p-4">
+            <div className="flex items-end gap-2 rounded-[1.25rem] border border-slate-200 bg-slate-50 px-3 py-3 shadow-sm focus-within:border-indigo-400 focus-within:bg-white">
+              <textarea
+                value={chatInput}
+                onChange={(event) => setChatInput(event.target.value)}
+                placeholder={rows.length > 0 ? "Ask about your data..." : "Upload a file first to start chatting..."}
+                rows={2}
+                disabled={rows.length === 0 || isUploading}
+                className="min-h-[48px] flex-1 resize-none bg-transparent text-sm text-slate-800 outline-none placeholder:text-slate-400 disabled:cursor-not-allowed"
+              />
+              <button
+                type="submit"
+                disabled={!chatInput.trim() || rows.length === 0 || isChatting || isUploading}
+                className="inline-flex h-11 w-11 items-center justify-center rounded-2xl bg-indigo-600 text-white transition hover:bg-indigo-500 disabled:cursor-not-allowed disabled:bg-slate-300"
+              >
+                <Send className="h-4 w-4" />
+              </button>
+            </div>
+            <p className="mt-2 text-[11px] leading-5 text-slate-500">
+              Ask natural language questions like “What are the top categories?” or “Show the average sales by day.”
+            </p>
+          </form>
+        </aside>
+      ) : null}
     </main>
   );
 }
